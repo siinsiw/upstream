@@ -342,6 +342,9 @@ FA = {
     "Only startup entries are removed one value at a time": "فقط مقدارهای راه‌اندازی را می‌توان تک‌به‌تک حذف کرد",
 }
 
+from .translations import collect as _collect_parts  # noqa: E402 - the parts import nothing from here
+
+FA.update(_collect_parts())
 _TABLES = {"fa": FA}
 _lang = "en"
 
@@ -371,6 +374,12 @@ def isolate(text: str) -> str:
 def isolate_lines(text: str) -> str:
     """Per line, because a line break inside a label does not start a new bidi paragraph."""
     return "\n".join(isolate(line) for line in text.split("\n")) if is_rtl() else text
+
+
+def N_(text: str) -> str:
+    """Mark an English template for translation where it is stored (in a dataclass, a tuple, a table)
+    and shown later through tr() or render()."""
+    return text
 
 
 def tr(source: str, /, **values) -> str:

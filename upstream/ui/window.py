@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton, QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from ..context import CancelToken, Question, UpdateContext
 from ..i18n import english, num, render, tr, trn
 from ..scanner import AppStatus, Scanner
 from ..updater import Updater
@@ -39,6 +40,15 @@ class Bus(QObject):
     job_progress = Signal(str, str, object, int)        # uid, template, values, percent
     job_finished = Signal(str, bool, str, object, str)  # uid, ok, template, values, version
     log_line = Signal(str)
+    question = Signal(object, object)                    # context.Question, _Answer
+
+
+class _Answer:
+    """Carries the user's reply from the UI thread back to the worker that asked."""
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = False
 
 
 class UiLogHandler(logging.Handler):
@@ -59,7 +69,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = settings
         self.scanner = Scanner(settings, cache)
-        self.updater = Updater()
+        self.updater = Updater(settings)
         self.bus = Bus()
         self.statuses: dict[str, AppStatus] = {}
         self.rows: dict[str, list[AppRow]] = {}
@@ -70,6 +80,8 @@ class MainWindow(QMainWindow):
         # ("queued",) | ("progress", template, values, pct) | ("result", ok, template, values, version)
         self.job_state: dict[str, tuple] = {}
         self.jobs: queue.Queue[str] = queue.Queue()
+        self.cancels: dict[str, CancelToken] = {}   # uid -> token of a queued or running update
+        self.bulk_jobs: set[str] = set()            # uids queued by "Update all"
         self.scanning = False
         self.last_scan: datetime | None = None
         self.current_tab = "updates"
@@ -85,6 +97,7 @@ class MainWindow(QMainWindow):
         self.bus.job_progress.connect(self._on_job_progress)
         self.bus.job_finished.connect(self._on_job_finished)
         self.bus.log_line.connect(self.log_view.appendPlainText)
+        self.bus.question.connect(self._on_question)
         logging.getLogger("upstream").addHandler(UiLogHandler(self.bus))
 
         self.icon_timer = QTimer(self)
@@ -436,7 +449,7 @@ class MainWindow(QMainWindow):
         self.log_btn.setText(tr("Hide log") if visible else tr("Show log"))
 
     # -- updates -------------------------------------------------------
-    def request_update(self, uid: str):
+    def request_update(self, uid: str, bulk: bool = False):
         s = self.statuses.get(uid)
         if not s or not s.update or uid in self.active_jobs or self._uninstall_running():
             return
@@ -445,6 +458,9 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(upd.page_url))
             return
         self.active_jobs.add(uid)
+        self.cancels[uid] = CancelToken()
+        if bulk:
+            self.bulk_jobs.add(uid)
         self._set_state(uid, ("queued",))
         self.jobs.put(uid)
         self._update_counts()
@@ -454,7 +470,17 @@ class MainWindow(QMainWindow):
             s = self.statuses[uid]
             if s.update.source == "site" and not s.update.download_url and not s.fallbacks:
                 continue
-            self.request_update(uid)
+            self.request_update(uid, bulk=True)
+
+    def cancel_job(self, uid: str):
+        """Stop a queued update, or ask the running one to stop."""
+        token = self.cancels.get(uid)
+        if token is not None:
+            token.cancel()
+
+    def cancel_all_jobs(self):
+        for token in list(self.cancels.values()):
+            token.cancel()
 
     def _job_loop(self):
         while True:
@@ -464,10 +490,15 @@ class MainWindow(QMainWindow):
                 self.bus.job_finished.emit(uid, False, "No update pending anymore", {}, "")
                 continue
             name = status.app.name
+            token = self.cancels.get(uid) or CancelToken()
+            if token.is_set:
+                self.bus.job_finished.emit(uid, False, "Cancelled.", {}, "")
+                continue
+            ctx = UpdateContext(self.settings, token, partial(self._ask_from_worker, token), uid in self.bulk_jobs)
             log.info("Updating %s from %s (%s)", name, status.update.source, status.update.origin)
             try:
                 ok, template, values, version = self.updater.run(
-                    status, lambda t, pct, **v: self.bus.job_progress.emit(uid, t, v, pct))
+                    status, lambda t, pct, **v: self.bus.job_progress.emit(uid, t, v, pct), ctx)
             except Exception as e:
                 log.exception("update failed")
                 ok, template, values, version = False, "{error}", {"error": str(e)}, ""
@@ -493,8 +524,33 @@ class MainWindow(QMainWindow):
     def _on_job_progress(self, uid: str, template: str, values: dict, pct: int):
         self._set_state(uid, ("progress", template, values, pct))
 
+    def _ask_from_worker(self, token: CancelToken, question: Question) -> bool:
+        """Runs on an update's worker thread: show the question in the window and wait for the reply."""
+        answer = _Answer()
+        self.bus.question.emit(question, answer)
+        while not answer.event.wait(0.25):
+            if token.is_set:
+                return False
+        return answer.value
+
+    def _on_question(self, question: Question, answer: _Answer):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning if question.danger else QMessageBox.Question)
+        box.setWindowTitle(tr("Upstream"))
+        box.setText(render(question.template, question.values))
+        if question.detail:
+            box.setInformativeText(render(question.detail, question.values))
+        yes = box.addButton(tr(question.yes), QMessageBox.AcceptRole)
+        no = box.addButton(tr(question.no), QMessageBox.RejectRole)
+        box.setDefaultButton(no if question.danger else yes)
+        box.exec()
+        answer.value = box.clickedButton() is yes
+        answer.event.set()
+
     def _on_job_finished(self, uid: str, ok: bool, template: str, values: dict, version: str):
         self.active_jobs.discard(uid)
+        self.cancels.pop(uid, None)
+        self.bulk_jobs.discard(uid)
         s = self.statuses.get(uid)
         if ok and s:
             s.app.version = version or s.app.version

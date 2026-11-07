@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 
+from . import net
 from .inventory import InstalledApp
 from .versioning import is_newer, parse_version
 
@@ -200,7 +201,7 @@ class GitHub:
         if etag:
             req.add_header("If-None-Match", etag)
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with net.urlopen(req, timeout=20) as resp:
                 self.remaining = resp.headers.get("X-RateLimit-Remaining", self.remaining)
                 return 200, json.load(resp), resp.headers.get("ETag")
         except urllib.error.HTTPError as e:

@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import logging
 import os
 import re
 import subprocess
-import urllib.request
 from ctypes import wintypes
 from pathlib import Path
 
-from .config import DOWNLOAD_DIR
+from .errors import Cancelled, InstallError  # noqa: F401 - re-exported
 
 log = logging.getLogger("upstream.installer")
 
@@ -39,49 +37,6 @@ _SIGNATURES = [
 _WINGET_TYPES = {"inno": "inno", "nullsoft": "nullsoft", "burn": "burn", "wix": "msi", "msi": "msi",
                  "msix": "msix", "appx": "msix"}
 _SUCCESS = {0, 3010, 1641}  # 3010/1641: done, restart needed
-
-
-class InstallError(Exception):
-    """Carries an English template and its values so the UI can show it in
-    whichever language is active when the message is displayed."""
-
-    def __init__(self, template: str, **values):
-        super().__init__(template.format(**values) if values else template)
-        self.template, self.values = template, values
-
-
-class Cancelled(InstallError):
-    pass
-
-
-def download(url: str, file_name: str | None, on_progress, expected_sha256: str | None = None) -> Path:
-    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        if not file_name:
-            disposition = resp.headers.get("Content-Disposition") or ""
-            m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disposition)
-            file_name = m.group(1) if m else resp.url.rsplit("/", 1)[-1].split("?", 1)[0]
-        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", file_name).strip(". ") or "installer.exe"
-        dest = DOWNLOAD_DIR / safe
-        part = dest.with_name(dest.name + ".part")
-        total = int(resp.headers.get("Content-Length") or 0)
-        digest = hashlib.sha256()
-        done = 0
-        with open(part, "wb") as fh:
-            while True:
-                chunk = resp.read(256 * 1024)
-                if not chunk:
-                    break
-                fh.write(chunk)
-                digest.update(chunk)
-                done += len(chunk)
-                on_progress(done, total)
-    if expected_sha256 and digest.hexdigest().lower() != expected_sha256.lower():
-        part.unlink(missing_ok=True)
-        raise InstallError("The download's SHA-256 doesn't match the hash GitHub published; nothing was installed.")
-    os.replace(part, dest)
-    return dest
 
 
 def signature(path: Path) -> tuple[str, str]:
@@ -134,7 +89,7 @@ _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintype
 _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 
-def _shell_run(file: str, params: str, show: int = 1) -> int:
+def _shell_run(file: str, params: str, show: int = 1, cancel=None) -> int:
     """ShellExecuteEx + wait. Unlike CreateProcess it shows the UAC prompt for
     installers whose manifest asks for admin rights."""
     info = _ShellExecuteInfo()
@@ -160,10 +115,14 @@ def _shell_run(file: str, params: str, show: int = 1) -> int:
         _kernel32.CloseHandle(info.hProcess)
 
 
-def install(path: Path, kind: str, scope: str) -> int:
+def install(path: Path, kind: str, scope: str, plan=None, cancel=None) -> int:
+    """Run the installer and return its exit code. `plan` (inplace.InstallPlan) adds switches that
+    keep the update in the app's existing folder; `cancel` (context.CancelToken) lets the user stop
+    waiting."""
+    extra = f" {plan.extra_args}" if plan is not None and plan.extra_args else ""
     if kind == "msi":
         # /passive: progress bar only, and unlike /qn it can raise UAC itself.
-        return _shell_run("msiexec.exe", f'/i "{path}" /passive /norestart')
+        return _shell_run("msiexec.exe", f'/i "{path}" /passive /norestart{extra}', cancel=cancel)
     if kind == "msix":
         literal = str(path).replace("'", "''")
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -178,7 +137,7 @@ def install(path: Path, kind: str, scope: str) -> int:
     params = SILENT_ARGS.get(kind, "")
     if kind == "inno" and scope == "user":
         params += " /CURRENTUSER"
-    return _shell_run(str(path), params)
+    return _shell_run(str(path), (params + extra).strip(), cancel=cancel)
 
 
 def succeeded(code: int) -> bool:

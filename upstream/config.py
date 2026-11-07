@@ -80,6 +80,14 @@ class Settings(JsonStore):
             "include_prereleases": False,
             "language": "en",
             "theme": "system",
+            # --- install safety (wave 1) ---
+            "publisher_policy": "ask",        # ask | block | off: an update signed by a different publisher
+            "signers": {},                    # ident -> certificate CN last seen on a verified install
+            "close_apps_policy": "ask",       # ask | auto | never: running app that an update would replace
+            "proxy": {"mode": "system", "url": ""},   # system | none | custom
+            "metered_policy": "ask",          # ask | skip | ignore: downloading on a metered connection
+            "battery_policy": "ask",          # ask | skip | ignore: updating while on battery
+            "install_timeout_min": 30,        # stop waiting for one installer after this many minutes
         })
 
     def override(self, ident: str) -> dict:

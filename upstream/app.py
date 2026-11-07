@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
+from . import net
 from .config import Cache, Settings, migrate_legacy, setup_logging
 from .i18n import LANGUAGES
 from .ui.locale import apply_language
@@ -29,6 +30,7 @@ def main() -> int:
     migrate_legacy()
     settings = Settings()
     _clean_settings(settings)
+    net.configure(settings)
 
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     try:

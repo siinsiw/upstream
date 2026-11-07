@@ -6,6 +6,8 @@ import re
 import urllib.parse
 import urllib.request
 
+from . import net
+
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Upstream-Updater/1.0"
 
 
@@ -13,7 +15,7 @@ def check(rule: dict) -> tuple[str, str | None]:
     """(latest version, download URL or None)."""
     page = rule["url"]
     req = urllib.request.Request(page, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with net.urlopen(req, timeout=20) as resp:
         html = resp.read(3 * 1024 * 1024).decode(resp.headers.get_content_charset() or "utf-8", "replace")
     m = re.search(rule["version_regex"], html, re.I | re.S)
     if not m:

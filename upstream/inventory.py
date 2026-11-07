@@ -53,6 +53,7 @@ class InstalledApp:
     no_remove: bool = False
     product_code: str | None = None   # the {GUID} subkey of a Windows Installer entry
     system_component: bool = False
+    install_kind: str = ""        # installer framework of this copy (inno, nullsoft, msi, burn, ...); inplace.py
 
     @property
     def ident(self) -> str:
