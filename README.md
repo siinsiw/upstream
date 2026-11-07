@@ -53,6 +53,30 @@ If one source fails, the next is tried automatically.
 - The Authenticode signature is checked and a tampered file is never run.
 - Installers that need admin rights show the Windows UAC prompt.
 
+### Install safety
+
+- **Replaces the old copy, never sits next to it.** The installer family of the installed app is
+  recognised. An update from a different family, or an MSI that is not an upgrade of the installed
+  product, is refused (the next source is tried, e.g. winget). Inno Setup and NSIS updates reuse
+  the app's existing folder.
+- **Publisher check.** If the new installer is signed by someone other than the app's usual
+  publisher (learned from the installed files and from earlier verified installs), or is unsigned
+  while the app is signed, Upstream asks first or blocks it, as chosen in Settings.
+- **Open apps.** The app's running processes are asked to close (the window is told to close; a
+  forced stop is only ever offered, never automatic). Only processes inside the app's own folder
+  are touched.
+- **Exit codes are understood.** Restart needed, another installation in progress (waits and
+  retries), cancelled by the user (no other source starts), already installed, access denied and
+  disk full each get their own message.
+- **The result is checked.** After the installer exits Upstream looks at what Windows lists: installed,
+  restart needed, installed next to the old copy, or unchanged (the update stays offered).
+- **Cancellable queue.** Every queued or running update has Cancel (or Stop waiting once the
+  installer has started; the installer itself is never killed mid-write), plus Cancel all. A stuck
+  installer is given up on after a time limit and does not block the rest of the queue.
+- **Network.** Proxy settings (Windows default, none or custom), downloads that resume after a
+  dropped connection, HTTPS-only downloads unless a checksum is published, and a question before
+  downloading on a metered connection or updating on low battery.
+
 ## Uninstalling
 
 Every app's ⋯ menu has **Uninstall…**. Upstream runs the app's own uninstaller, quietly when it
@@ -74,6 +98,8 @@ now: nothing is deleted. Cleanup with backups and undo is the next step.
 - **Theme:** System (follows Windows light/dark), Paper, Graphite, Midnight, Arctic, Dune,
   Moss, High contrast.
 - **Sources:** use the GitHub CLI token when signed in; offer pre-releases.
+- **Install safety:** publisher check (ask, block, off), running apps (ask, close automatically,
+  leave to the installer), metered connection, battery, proxy, and the installer time limit.
 
 ## GitHub token
 
@@ -85,9 +111,9 @@ with ETags, so repeat checks barely touch the quota.
 
 | Path | Contents |
 |---|---|
-| `%APPDATA%\Upstream\settings.json` | language, theme, source overrides, ignored apps, skipped versions |
+| `%APPDATA%\Upstream\settings.json` | language, theme, source overrides, ignored apps, skipped versions, install-safety policies, proxy (a proxy password is stored in plain text) |
 | `%LOCALAPPDATA%\Upstream\cache.json` | each app's repository and the latest releases |
-| `%LOCALAPPDATA%\Upstream\downloads\` | installers; deleted after a successful install |
+| `%LOCALAPPDATA%\Upstream\downloads\` | installers and partial downloads (`.part`); installers are deleted after the install, partials are kept to resume |
 | `%LOCALAPPDATA%\Upstream\upstream.log` | full log |
 
 Settings from the earlier name (Tazeh) are copied over on first start.
@@ -101,8 +127,14 @@ upstream/
   github.py      repository discovery, releases, installer asset choice
   site.py        user-defined official-site rule
   scanner.py     decides each app's source
-  installer.py   download, hash and signature checks, silent install
-  updater.py     runs one update with fallbacks
+  installer.py   installer type, signature, silent install with a cancellable wait
+  net.py         proxy, resumable HTTPS downloads, metered/battery policy
+  trust.py       publisher check
+  inplace.py     makes an update replace the installed copy
+  running.py     closes the app's running processes
+  exitcodes.py   what an installer's exit code means
+  verify.py      what changed on the PC after the install
+  updater.py     runs one update through those steps, with fallbacks
   uninstaller.py plans and runs an app's own uninstaller, then verifies it is gone
   leftovers.py   read-only leftover scan with confidence levels
   guard.py       paths and registry keys that are never offered for removal
