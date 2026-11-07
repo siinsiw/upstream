@@ -11,7 +11,7 @@ FA: dict[str, str] = {
     "It may not replace the installed copy.":
         "برنامهٔ {name} به‌صورت بستهٔ MSI نصب شده، ولی این به‌روزرسانی با {new} بسته‌بندی شده است. "
         "شاید جایگزین نسخهٔ نصب‌شده نشود.",
-    "The installed copy of {name} is for all users, but this installer sets up the "
+    "The installed copy of {name} is for all users, but this installer sets the app up for the "
     "current user only. The update may end up as a second copy.":
         "نسخهٔ نصب‌شدهٔ {name} برای همهٔ کاربران است، ولی این نصب‌کننده فقط برای کاربر فعلی نصب می‌کند. "
         "شاید نتیجه یک نسخهٔ دوم باشد.",

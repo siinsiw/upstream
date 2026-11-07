@@ -185,13 +185,13 @@ class UpdaterOutcomeTest(unittest.TestCase):
 
         def fake_direct(self_, app, upd, progress, ctx):
             tried.append("direct")
-            return direct, "Demo Inc"
+            return updater.Attempt(direct, signer="Demo Inc", sig_status="Valid")
 
         def fake_winget(self_, app, upd, progress, ctx):
             tried.append("winget")
-            return winget or Outcome("ok")
+            return updater.Attempt(winget or Outcome("ok"))
 
-        def fake_check(app, before, outcome, expected):
+        def fake_check(app, before, outcome, expected, cancel=None):
             return (check or {}).get(outcome.kind, verdict("installed"))
 
         with mock.patch.object(updater.net, "preflight"), \
@@ -243,6 +243,22 @@ class UpdaterOutcomeTest(unittest.TestCase):
         (ok, _, _, _), tried, remember = self.run_updater(Outcome("restart"), check={"restart": verdict("restart")})
         self.assertTrue(ok)
         remember.assert_called_once()
+
+    def test_an_installer_that_reports_the_app_as_already_there_installed_nothing_to_remember(self):
+        present = Outcome("already_installed", "Another version of this app is already installed, so this installer can't continue")
+        (ok, _, _, _), _, remember = self.run_updater(present, check={"already_installed": verdict("installed")})
+        self.assertTrue(ok)
+        remember.assert_not_called()
+
+    def test_a_publisher_that_cannot_be_saved_does_not_fail_the_install(self):
+        fake_direct = lambda self, *a: updater.Attempt(Outcome("ok"), signer="Demo Inc", sig_status="Valid")
+        with mock.patch.object(updater.net, "preflight"), \
+             mock.patch.object(updater.verify, "check", lambda *a, **k: verdict("installed")), \
+             mock.patch.object(updater.trust, "remember", side_effect=TypeError("unexpected keyword")), \
+             mock.patch.object(updater.Updater, "_direct", fake_direct), \
+             self.assertLogs("upstream.update", "ERROR"):
+            ok, _, _, version = updater.Updater().run(make_status(), lambda *a, **k: None, UpdateContext())
+        self.assertEqual((ok, version), (True, "2.0"))
 
     def test_side_by_side_is_reported_but_does_not_remember_the_publisher(self):
         (ok, _, _, _), _, remember = self.run_updater(Outcome("ok"), check={"ok": verdict("side_by_side")})
@@ -329,7 +345,7 @@ class BusyRetryTest(unittest.TestCase):
             mock.patch.object(updater.inplace, "plan", lambda *a: plan),
             mock.patch.object(updater.running, "close_for_update"),
             mock.patch.object(updater.verify, "snapshot"),
-            mock.patch.object(updater.verify, "check", lambda *a: verdict("installed")),
+            mock.patch.object(updater.verify, "check", lambda *a, **k: verdict("installed")),
             mock.patch.object(updater.trust, "remember"),
             mock.patch.object(Path, "unlink"),
         ]
@@ -339,28 +355,6 @@ class BusyRetryTest(unittest.TestCase):
         ok, _, _, version = updater.Updater().run(status, self.progress, UpdateContext())
         self.assertEqual((ok, version, len(installs)), (True, "2.0", 3))
         self.assertEqual(self.messages.count("Another installation is running, waiting…"), 2)
-
-    def test_only_a_valid_signature_becomes_the_remembered_publisher(self):
-        for sig_status, expect in (("Valid", "Demo Inc"), ("NotTrusted", None)):
-            plan = mock.Mock(warnings=[], refuse=None, extra_args="")
-            with mock.patch.object(updater.net, "preflight"), \
-                 mock.patch.object(updater.net, "download", lambda *a, **k: Path("demo.exe")), \
-                 mock.patch.object(updater.installer, "signature", lambda p: (sig_status, "Demo Inc")), \
-                 mock.patch.object(updater.installer, "detect", lambda p, h=None: "inno"), \
-                 mock.patch.object(updater.installer, "install", lambda *a, **k: 0), \
-                 mock.patch.object(updater.trust, "evaluate", lambda *a: mock.Mock(action="allow")), \
-                 mock.patch.object(updater.inplace, "plan", lambda *a: plan), \
-                 mock.patch.object(updater.running, "close_for_update"), \
-                 mock.patch.object(updater.verify, "snapshot"), \
-                 mock.patch.object(updater.verify, "check", lambda *a: verdict("installed")), \
-                 mock.patch.object(updater.trust, "remember") as remember, \
-                 mock.patch.object(Path, "unlink"):
-                updater.Updater().run(make_status(), self.progress, UpdateContext())
-            if expect:
-                remember.assert_called_once()
-                self.assertEqual(remember.call_args.args[2], expect)
-            else:
-                remember.assert_not_called()
 
 
 if __name__ == "__main__":

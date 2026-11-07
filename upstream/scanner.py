@@ -166,8 +166,13 @@ class Scanner:
         override = self.settings.override(app.ident)
         meta = self._meta(s.winget_id)
         # A repo the user typed always wins; otherwise the links on the app and in its winget manifest are scored.
-        s.repo = override.get("github") or self.github.discover(
-            app, [*app.urls, *meta.get("urls", [])], s.winget_id, self.arch)
+        # `winget show` lists the installer URL last and the cache keeps only a dozen links, so the strongest
+        # evidence (a /releases/download/ link) is added from the installer URL itself.
+        urls = [*app.urls, *meta.get("urls", [])]
+        installer_url = meta.get("installer_url")
+        if isinstance(installer_url, str) and "github.com/" in installer_url.lower() and installer_url not in urls:
+            urls.append(installer_url)
+        s.repo = override.get("github") or self.github.discover(app, urls, s.winget_id, self.arch)
         s.update, s.fallbacks = None, []
         s.set_note("")
         chain: list[Update] = []

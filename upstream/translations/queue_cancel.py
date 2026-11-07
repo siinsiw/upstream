@@ -9,7 +9,7 @@ FA: dict[str, str] = {
         "انتظار برای نصب‌کننده متوقف شد. ممکن است هنوز در حال اجرا باشد.",
     "The installer was still running after {minutes} minutes, so Upstream stopped waiting for it. "
     "It may still be running.":
-        "نصب‌کننده پس از {minutes} دقیقه هنوز کار می‌کرد، برای همین انتظار برایش متوقف شد. "
-        "ممکن است هنوز در حال اجرا باشد.",
+        "نصب‌کننده پس از {minutes} دقیقه هنوز در حال اجرا بود، برای همین Upstream دیگر منتظرش نماند. "
+        "شاید هنوز کار کند.",
     "Lost track of the installer (Windows error {code}).": "ردیابی نصب‌کننده ممکن نشد (خطای ویندوز {code}).",
 }

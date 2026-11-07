@@ -15,7 +15,7 @@ from upstream.inventory import InstalledApp
 
 class FakeSettings:
     def __init__(self, **data):
-        self.data = {"publisher_policy": "ask", "signers": {}, **data}
+        self.data = {"publisher_policy": "ask", "signers": {}, "signers_approved": {}, **data}
         self.saved = 0
 
     def get(self, key, default=None):
@@ -50,18 +50,44 @@ class TrustTestCase(unittest.TestCase):
 
 
 class SamePublisherTest(TrustTestCase):
-    def test_legal_forms_case_and_punctuation_are_ignored(self):
-        for a, b in [("Microsoft Corporation", "Microsoft Corp."), ("Google LLC", "google inc"),
-                     ("Dropbox, Inc.", "Dropbox"), ("Notepad++ Team", "Notepad++"), ("Spotify AB", "SPOTIFY"),
-                     ("Igor Pavlov", "Pavlov Igor"), ("Valve Corp.", "Valve")]:
-            with self.subTest(a=a, b=b):
-                self.assertTrue(trust._same_publisher(a, b))
+    SAME = [("Microsoft Corporation", "Microsoft Corp."), ("Google LLC", "google inc"), ("Google LLC", "Google, LLC"),
+            ("Dropbox, Inc.", "Dropbox"), ("Notepad++", "Notepad++"), ("Spotify AB", "SPOTIFY"),
+            ("Igor Pavlov", "Pavlov Igor"), ("Valve Corp.", "Valve"), ("Mozilla Corporation", "MOZILLA CORP")]
+    # A longer or shorter name is a different certificate holder, whichever way round.
+    SPOOFS = [("Microsoft Corporation", "Microsoft Corporation Fake Ltd"), ("Google LLC", "Google Updates Ltd"),
+              ("Mozilla Corporation", "Mozilla Foundation"), ("Notepad++ Team", "Notepad++"),
+              ("Adobe Inc.", "Adobe Systems Incorporated")]
+    DIFFERENT = [("Adobe Inc.", "Mozilla Corporation"), ("Microsoft Corporation", "Micro Star International"),
+                 ("Demo", "Cleaner Pro Ltd"), ("", "Demo"), ("Inc.", "Demo Inc."), ("Demo", ""), ("Inc.", "LLC")]
+
+    def test_certificate_names_match_when_only_case_punctuation_order_and_legal_forms_differ(self):
+        for a, b in self.SAME:
+            for x, y in ((a, b), (b, a)):
+                with self.subTest(a=x, b=y):
+                    self.assertTrue(trust._same_publisher(x, y))
+                    self.assertTrue(trust._same_publisher(x, y, strong=False))
+
+    def test_certificate_names_must_be_equal_not_just_contained(self):
+        for a, b in self.SPOOFS:
+            for x, y in ((a, b), (b, a)):
+                with self.subTest(a=x, b=y):
+                    self.assertFalse(trust._same_publisher(x, y))
+
+    def test_registry_text_only_has_to_be_contained_in_the_signer_name(self):
+        for text, signer in [("Notepad++", "Notepad++ Team"), ("Google LLC", "Google Updates Ltd"),
+                             ("Demo Software Inc.", "Demo Software Europe GmbH")]:
+            with self.subTest(text=text, signer=signer):
+                self.assertTrue(trust._same_publisher(text, signer, strong=False))
+        for text, signer in [("Notepad++ Team", "Notepad++"), ("Google Updates Ltd", "Google LLC"),
+                             ("Mozilla Foundation", "Mozilla Corporation")]:
+            with self.subTest(text=text, signer=signer):
+                self.assertFalse(trust._same_publisher(text, signer, strong=False))
 
     def test_different_names_do_not_match(self):
-        for a, b in [("Adobe Inc.", "Mozilla Corporation"), ("Microsoft Corporation", "Micro Star International"),
-                     ("Demo", "Cleaner Pro Ltd"), ("", "Demo"), ("Inc.", "Demo Inc."), ("Demo", "")]:
-            with self.subTest(a=a, b=b):
-                self.assertFalse(trust._same_publisher(a, b))
+        for a, b in self.DIFFERENT:
+            for strong in (True, False):
+                with self.subTest(a=a, b=b, strong=strong):
+                    self.assertFalse(trust._same_publisher(a, b, strong))
 
 
 class PolicyTest(TrustTestCase):
@@ -82,6 +108,20 @@ class PolicyTest(TrustTestCase):
         self.assertIn("{signer}", d.template)
         self.assertTrue(d.detail)
 
+    def test_a_lookalike_signer_is_not_the_installed_publisher(self):
+        for installed, signer in [("Microsoft Corporation", "Microsoft Corporation Fake Ltd"),
+                                  ("Google LLC", "Google Updates Ltd"), ("Mozilla Corporation", "Mozilla Foundation")]:
+            for policy, action in (("ask", "ask"), ("block", "block")):
+                d = self.evaluate("Valid", signer, FakeSettings(publisher_policy=policy), installed=installed)
+                with self.subTest(installed=installed, signer=signer, policy=policy):
+                    self.assertEqual((d.action, d.values["usual"], d.values["signer"]), (action, installed, signer))
+
+    def test_spelling_variants_of_the_installed_publisher_are_allowed(self):
+        for installed, signer in [("Google LLC", "Google, LLC"), ("Microsoft Corporation", "Microsoft Corp."),
+                                  ("Notepad++", "Notepad++")]:
+            with self.subTest(installed=installed, signer=signer):
+                self.assertEqual(self.evaluate("Valid", signer, installed=installed).action, "allow")
+
     def test_block_policy_blocks_a_different_signer(self):
         d = self.evaluate("Valid", "Mallory Ltd", FakeSettings(publisher_policy="block"), installed="Demo Software Inc")
         self.assertEqual(d.action, "block")
@@ -97,7 +137,8 @@ class PolicyTest(TrustTestCase):
         self.assertEqual(d.action, "ask")
 
     def test_every_template_formats_with_its_values(self):
-        cases = [("Valid", "Mallory Ltd"), ("NotSigned", ""), ("NotTrusted", "Mallory Ltd"), ("Unknown", "")]
+        cases = [("Valid", "Mallory Ltd"), ("NotSigned", ""), ("NotTrusted", "Mallory Ltd"), ("Unknown", ""),
+                 ("Incompatible", "")]
         for policy in ("ask", "block"):
             for status, signer in cases:
                 d = self.evaluate(status, signer, FakeSettings(publisher_policy=policy), installed="Demo Software Inc")
@@ -105,6 +146,51 @@ class PolicyTest(TrustTestCase):
                     self.assertEqual(d.action, policy)
                     self.assertIn("Demo App", InstallError(d.template, **d.values).args[0])
                     d.detail.format(**d.values)
+
+
+class NoBaselineTest(TrustTestCase):
+    """Nothing signed to compare with: unsigned is normal, but a signature Windows rejects is not."""
+    BAD = [("NotTrusted", "Mallory Ltd"), ("UnknownError", ""), ("Incompatible", ""), ("HashMismatch", "Mallory Ltd"),
+           ("NotSupportedFileFormat", ""), ("SomethingNew", "")]
+
+    def test_only_not_signed_and_unknown_pass_silently(self):
+        for publisher in ("Demo Software Inc.", ""):
+            for status in ("NotSigned", "Unknown", ""):
+                for policy in ("ask", "block"):
+                    d = self.evaluate(status, "", FakeSettings(publisher_policy=policy),
+                                      app=make_app(publisher=publisher))
+                    with self.subTest(publisher=publisher, status=status, policy=policy):
+                        self.assertEqual(d.action, "allow")
+
+    def test_a_failed_signature_lookup_is_logged_not_silent(self):
+        self.assertEqual(self.evaluate("Unknown", "").action, "allow")
+        self.log.warning.assert_called_once()
+
+    def test_any_other_bad_status_asks_or_blocks(self):
+        for publisher in ("Demo Software Inc.", ""):
+            for status, signer in self.BAD:
+                for policy in ("ask", "block"):
+                    d = self.evaluate(status, signer, FakeSettings(publisher_policy=policy),
+                                      app=make_app(publisher=publisher))
+                    with self.subTest(publisher=publisher, status=status, policy=policy):
+                        self.assertEqual(d.action, policy)
+                        self.assertEqual(d.values["name"], "Demo App")
+                        self.assertIn("couldn't verify", d.template)
+                        self.assertEqual(bool(d.detail), policy == "ask")
+                        self.assertIn("Demo App", InstallError(d.template, **d.values).args[0])
+                        d.detail.format(**d.values)
+
+    def test_the_registry_text_is_named_when_there_is_one(self):
+        d = self.evaluate("NotTrusted", "Mallory Ltd")
+        self.assertEqual(d.values, {"name": "Demo App", "usual": "Demo Software Inc."})
+        d = self.evaluate("NotTrusted", "Mallory Ltd", app=make_app(publisher=""))
+        self.assertEqual(d.values, {"name": "Demo App"})
+
+    def test_valid_signatures_are_unaffected(self):
+        self.assertEqual(self.evaluate("Valid", "Anyone Ltd", app=make_app(publisher="")).action, "allow")
+        self.assertEqual(self.evaluate("Valid", "", app=make_app(publisher="")).action, "allow")
+        self.assertEqual(self.evaluate("Valid", "Demo Software Europe GmbH").action, "allow")
+        self.assertEqual(self.evaluate("Valid", "Mallory Ltd").action, "ask")
 
 
 class UnsignedTest(TrustTestCase):
@@ -119,7 +205,7 @@ class UnsignedTest(TrustTestCase):
     def test_untrusted_or_unknown_status_gets_its_own_wording(self):
         unsigned = self.evaluate("NotSigned", "", installed="Demo Software Inc")
         for status, signer in [("NotTrusted", "Demo Software Inc"), ("UnknownError", ""), ("Unknown", ""),
-                               ("Valid", "")]:
+                               ("Incompatible", ""), ("Valid", "")]:
             d = self.evaluate(status, signer, installed="Demo Software Inc")
             with self.subTest(status=status, signer=signer):
                 self.assertEqual(d.action, "ask")
@@ -149,6 +235,13 @@ class BaselineOrderTest(TrustTestCase):
             d = trust.evaluate(settings, make_app(), "Valid", "Demo Software Inc")
         self.assertEqual(d.action, "ask")
         self.assertEqual(d.values["usual"], "Remembered Corp")
+
+    def test_the_remembered_signer_must_match_exactly(self):
+        settings = FakeSettings(signers={"demo app": "Microsoft Corporation"})
+        with mock.patch.object(trust, "_installed_signer", side_effect=AssertionError("not needed")):
+            self.assertEqual(trust.evaluate(settings, make_app(), "Valid", "Microsoft Corp").action, "allow")
+            d = trust.evaluate(settings, make_app(), "Valid", "Microsoft Corporation Fake Ltd")
+        self.assertEqual((d.action, d.values["usual"]), ("ask", "Microsoft Corporation"))
 
     def test_installed_signature_beats_the_registry_text(self):
         d = self.evaluate("Valid", "Demo Software Inc", installed="Real Vendor GmbH")
@@ -227,6 +320,118 @@ class RememberTest(TrustTestCase):
         trust.remember(settings, make_app(), "Demo Software Inc", "Valid")
         d = self.evaluate("Valid", "Mallory Ltd", settings, installed="")
         self.assertEqual((d.action, d.values["usual"]), ("ask", "Demo Software Inc"))
+
+
+class ApprovedSignerTest(TrustTestCase):
+    """The user said yes to a warning: that signer is accepted for this app, the remembered publisher stays."""
+
+    def test_the_signer_is_added_and_the_remembered_publisher_is_never_replaced(self):
+        settings = FakeSettings(signers={"demo app": "Real Vendor GmbH", "other": "Other Inc"})
+        self.evaluate("Valid", "New Owner Ltd", settings, installed="")
+        trust.remember(settings, make_app(), "New Owner Ltd", approved=True)
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["New Owner Ltd"]})
+        self.assertEqual(settings.data["signers"], {"demo app": "Real Vendor GmbH", "other": "Other Inc"})
+        self.assertEqual(settings.saved, 1)
+
+    def test_nothing_is_pinned_as_the_publisher_when_none_was_remembered_either(self):
+        settings = FakeSettings()
+        trust.remember(settings, make_app(), "New Owner Ltd", "Valid", approved=True)
+        self.assertEqual(settings.data["signers"], {})
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["New Owner Ltd"]})
+
+    def test_no_duplicates_and_other_apps_are_kept(self):
+        settings = FakeSettings(signers_approved={"demo app": ["New Owner Ltd"], "other": ["Else Inc"]})
+        for spelling in ("New Owner Ltd", "NEW OWNER, Ltd.", "New Owner Inc"):
+            trust.remember(settings, make_app(), spelling, "Valid", approved=True)
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["New Owner Ltd"], "other": ["Else Inc"]})
+        self.assertEqual(settings.saved, 0)
+        trust.remember(settings, make_app(), "Third Party GmbH", "Valid", approved=True)
+        self.assertEqual(settings.data["signers_approved"]["demo app"], ["New Owner Ltd", "Third Party GmbH"])
+        self.assertEqual(settings.data["signers_approved"]["other"], ["Else Inc"])
+
+    def test_old_or_damaged_settings_are_tolerated(self):
+        for broken in (None, "text", ["a"], 5, {"demo app": "New Owner Ltd"}, {"demo app": None}, {"demo app": 7}):
+            settings = FakeSettings(signers_approved=broken)
+            trust.remember(settings, make_app(), "New Owner Ltd", "Valid", approved=True)
+            with self.subTest(broken=broken):
+                self.assertEqual(settings.data["signers_approved"]["demo app"], ["New Owner Ltd"])
+        settings = FakeSettings()
+        del settings.data["signers_approved"]
+        self.assertEqual(self.evaluate("Valid", "Mallory Ltd", settings, installed="Real Vendor GmbH").action, "ask")
+        trust.remember(settings, make_app(), "New Owner Ltd", "Valid", approved=True)
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["New Owner Ltd"]})
+
+    def test_only_a_valid_signature_is_accepted_and_never_while_the_check_is_off(self):
+        settings = FakeSettings()
+        trust.remember(settings, make_app(), "New Owner Ltd", "NotTrusted", approved=True)
+        trust.remember(settings, make_app(), "New Owner Ltd", approved=True)
+        trust.remember(settings, make_app(), "", "Valid", approved=True)
+        trust.remember(None, make_app(), "New Owner Ltd", "Valid", approved=True)
+        off = FakeSettings(publisher_policy="off")
+        trust.remember(off, make_app(), "New Owner Ltd", "Valid", approved=True)
+        for each in (settings, off):
+            self.assertEqual(each.data["signers_approved"], {})
+            self.assertEqual(each.saved, 0)
+
+    def test_the_status_evaluate_saw_is_used_when_none_is_given(self):
+        settings = FakeSettings()
+        self.evaluate("Valid", "New Owner Ltd", settings, installed="Real Vendor GmbH")
+        trust.remember(settings, make_app(), "New Owner Ltd", approved=True)
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["New Owner Ltd"]})
+
+    def test_a_failing_save_does_not_raise(self):
+        settings = FakeSettings()
+        settings.save = mock.Mock(side_effect=OSError("disk full"))
+        trust.remember(settings, make_app(), "New Owner Ltd", "Valid", approved=True)
+        self.log.warning.assert_called_once()
+
+    def test_an_approved_signer_matches_the_strong_baseline_but_only_with_a_valid_signature(self):
+        settings = FakeSettings(signers={"demo app": "Real Vendor GmbH"},
+                                signers_approved={"demo app": ["New Owner Ltd"]})
+        for signer in ("New Owner Ltd", "new owner, inc.", "New Owner"):
+            with self.subTest(signer=signer):
+                self.assertEqual(self.evaluate("Valid", signer, settings).action, "allow")
+        for status in ("NotTrusted", "UnknownError", "NotSigned"):
+            with self.subTest(status=status):
+                self.assertEqual(self.evaluate(status, "New Owner Ltd", settings).action, "ask")
+
+    def test_an_approved_signer_is_only_good_for_its_own_app_and_by_exact_name(self):
+        settings = FakeSettings(signers={"demo app": "Real Vendor GmbH", "other": "Real Vendor GmbH"},
+                                signers_approved={"other": ["New Owner Ltd"]})
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings).action, "ask")
+        other = make_app(name="Other", reg_key=r"HKLM64\Other")
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings, app=other).action, "allow")
+        settings.data["signers_approved"]["demo app"] = ["New Owner Ltd"]
+        self.assertEqual(self.evaluate("Valid", "New Owner Fake Ltd", settings).action, "ask")
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings).action, "allow")
+
+    def test_an_approved_signer_also_stops_registry_text_questions(self):
+        settings = FakeSettings(signers_approved={"demo app": ["New Owner Ltd"]})
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings, installed="").action, "allow")
+        self.assertEqual(self.evaluate("Valid", "Mallory Ltd", settings, installed="").action, "ask")
+
+    def test_the_real_publisher_is_not_questioned_after_the_user_approved_another_signer(self):
+        settings, app = FakeSettings(signers={"demo app": "Real Vendor GmbH"}), make_app()
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings, app=app).action, "ask")
+        trust.remember(settings, app, "New Owner Ltd", approved=True)
+        self.assertEqual(settings.data["signers"], {"demo app": "Real Vendor GmbH"})
+        self.assertEqual(self.evaluate("Valid", "Real Vendor GmbH", settings, app=app).action, "allow")
+        self.assertEqual(self.evaluate("Valid", "New Owner Ltd", settings, app=app).action, "allow")
+        self.assertEqual(self.evaluate("Valid", "Mallory Ltd", settings, app=app).action, "ask")
+
+    def test_a_silent_install_by_an_approved_signer_does_not_become_the_remembered_publisher(self):
+        settings = FakeSettings(signers={"demo app": "Real Vendor GmbH"},
+                                signers_approved={"demo app": ["New Owner Ltd"]})
+        self.evaluate("Valid", "New Owner Ltd", settings)
+        trust.remember(settings, make_app(), "New Owner Ltd")
+        self.assertEqual(settings.data["signers"], {"demo app": "Real Vendor GmbH"})
+        self.assertEqual(settings.saved, 0)
+
+    def test_the_default_still_replaces_the_remembered_publisher(self):
+        settings = FakeSettings(signers={"demo app": "Old Name Inc"}, signers_approved={"demo app": ["Someone Else"]})
+        trust.remember(settings, make_app(), "New Name Inc", "Valid", approved=False)
+        self.assertEqual(settings.data["signers"], {"demo app": "New Name Inc"})
+        self.assertEqual(settings.data["signers_approved"], {"demo app": ["Someone Else"]})
 
 
 class InstalledSignerTest(TrustTestCase):

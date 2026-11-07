@@ -41,7 +41,8 @@ _NOT_WINDOWS = re.compile(r"linux|ubuntu|debian|fedora|centos|darwin|macos|\bmac
 _NOT_INSTALLER = re.compile(r"portable|symbols?|debug|\bpdb\b|sources?\b|\bsrc\b|uninstall|delta|blockmap", re.I)
 # Runtimes a project ships beside its own setup; installing one of them is never the update.
 _PREREQUISITE = re.compile(r"vc_?redist|dotnet-|windowsdesktop-runtime|webview2|directx", re.I)
-_MACHINE_WIDE = re.compile(r"all[-_ ]?users|per[-_ ]?machine|(?<![a-z])(?:machine|system|admin)(?![a-z])")
+# 'system' and 'admin' alone are part of product names (pgadmin4-8.0-admin-x64.exe), not an install scope.
+_MACHINE_WIDE = re.compile(r"all[-_ ]?users|per[-_ ]?machine|system[-_ ]?wide|(?<![a-z])machine(?![a-z])")
 # Many projects publish betas without ticking GitHub's "pre-release" box.
 _PRE_TAG = re.compile(r"(?<![a-z])(alpha|beta|rc|pre|preview|nightly|dev|canary|insiders?|snapshot)(?![a-z])", re.I)
 
@@ -68,6 +69,7 @@ _OTHER_PRODUCT = {
 }
 _SITE_REPO = re.compile(
     r"\.github\.io$|^(?:homebrew|scoop|chocolatey|awesome)-|^(?:docs?|www|site|website|wiki|blog)$", re.I)
+_DOWNLOAD_WEIGHT = 40   # _url_weight of a release-download link
 _ACCEPT_SCORE = 45  # points a repo needs from the links that mention it plus how well it fits the app
 _NEAR = 40          # candidates this close to the best are told apart by their releases
 _VERIFY_AT_MOST = 3
@@ -138,7 +140,7 @@ def _url_weight(rest: str) -> int:
     """How much a link says about the repo: a release download proves the installer lives there."""
     path = rest.lower()
     if path.startswith("/releases/download/"):
-        return 40
+        return _DOWNLOAD_WEIGHT
     if path.startswith("/releases"):
         return 20
     if path.startswith(("/issues", "/discussions", "/wiki", "/blob/", "/tree/", "/raw/")):
@@ -155,15 +157,19 @@ class RepoCandidate:
 def rank_repos(app: InstalledApp, urls, winget_id: str | None = None) -> list[RepoCandidate]:
     """The repositories the URLs point to that plausibly are this app's, best first. A link alone proves
     nothing (help pages link sponsors, docs and other projects): the repo must also look like the app by
-    name or owner, unless the link is a release download from an owner that matches the publisher."""
+    name or owner, unless the link is a release download from an owner that matches the publisher. An app
+    whose name has no Latin letters (Persian, Chinese...) gives nothing to match by name: its repo is then
+    a release-download link from an owner that matches the publisher, or the only repo the links name."""
     found: dict[str, tuple[str, list[int]]] = {}
     for url in urls:
         for repo, rest in _repo_refs(url):
             found.setdefault(repo.lower(), (repo, []))[1].append(_url_weight(rest))
     profile = _profile(app, winget_id)
-    ranked = []
+    unnamed = not profile.names
+    ranked, nameless = [], []
     for repo, weights in found.values():
         owner, name = repo.split("/", 1)
+        downloads = max(weights) >= _DOWNLOAD_WEIGHT
         proof = max(weights) + min(10, 5 * (len(weights) - 1))
         repo_words = set(_words(name))
         shared = repo_words & profile.words
@@ -175,10 +181,17 @@ def rank_repos(app: InstalledApp, urls, winget_id: str | None = None) -> list[Re
         published = max(max((_closeness(owner_c, p) for p in profile.publishers), default=0) * 5 // 12,
                         min(24, 12 * len(set(_words(owner)) & profile.publisher_words)))
         named = max(by_repo, by_owner)
-        penalty = 100 if _SITE_REPO.search(name) else 50 if (repo_words & _OTHER_PRODUCT) - profile.words else 0
+        other = (repo_words & _OTHER_PRODUCT) - profile.words
+        if "winget" in other and (downloads or "winget" in (winget_id or "").lower()):
+            other.discard("winget")   # microsoft/winget-cli is where App Installer is built and released
+        penalty = 100 if _SITE_REPO.search(name) else 50 if other else 0
         score = named + published + proof - penalty
-        if score >= _ACCEPT_SCORE and (named >= 20 or (proof >= 40 and published >= 12)):
+        if unnamed:
+            if not penalty:
+                nameless.append((RepoCandidate(repo, score), downloads and published > 0))
+        elif score >= _ACCEPT_SCORE and (named >= 20 or (proof >= 40 and published >= 12)):
             ranked.append(RepoCandidate(repo, score))
+    ranked += [c for c, from_publisher in nameless if from_publisher or len(nameless) == 1]
     ranked.sort(key=lambda c: -c.score)
     return ranked
 

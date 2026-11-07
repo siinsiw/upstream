@@ -14,3 +14,8 @@ class InstallError(Exception):
 class Cancelled(InstallError):
     """The user (or a policy the user chose) stopped the install. Not an error:
     no other source is tried afterwards."""
+
+
+class StoppedWaiting(Cancelled):
+    """Upstream stopped waiting for the installer (the user cancelled, or the time limit passed) but the
+    installer may still be running, so its file must stay where it is."""

@@ -2,10 +2,12 @@
 from __future__ import annotations
 
 import string
+import time
 import unittest
 from unittest import mock
 
 from upstream import i18n, verify
+from upstream.context import CancelToken
 from upstream.exitcodes import Outcome
 from upstream.inventory import InstalledApp
 from upstream.verify import Snapshot
@@ -153,6 +155,45 @@ class CheckTest(unittest.TestCase):
         self.assertEqual(v.kind, "installed")
         self.assertEqual(pc.reads, 2)
 
+    def test_settling_uses_the_cancel_token_instead_of_sleeping(self):
+        ticks = iter(range(100))
+        fake_time = mock.Mock(monotonic=lambda: next(ticks), sleep=mock.Mock())
+        cancel = mock.Mock(wait=mock.Mock(return_value=False))
+        with FakePC([OLD], [entry(OLD.reg_key, "2.0")]) as pc, mock.patch.object(verify, "SETTLE_SECONDS", 5), \
+             mock.patch.object(verify, "time", fake_time):
+            v = verify.check(OLD, Snapshot([OLD]), OK, "2.0", cancel=cancel)
+        self.assertEqual((v.kind, pc.reads), ("installed", 2))
+        cancel.wait.assert_called_once_with(1)
+        fake_time.sleep.assert_not_called()
+
+    def test_cancelling_ends_the_settle_wait_at_once(self):
+        ticks = iter(range(100))
+        fake_time = mock.Mock(monotonic=lambda: next(ticks), sleep=lambda s: None)
+        cancel = mock.Mock(wait=mock.Mock(side_effect=[False, True]))
+        with FakePC([OLD]) as pc, mock.patch.object(verify, "SETTLE_SECONDS", 5), mock.patch.object(verify, "time", fake_time):
+            v = verify.check(OLD, Snapshot([OLD]), OK, "2.0", cancel=cancel)
+        self.assertEqual((v.kind, v.ok, pc.reads), ("unchanged", False, 2))     # the first look, one more, then it stops
+        self.assertEqual(cancel.wait.call_count, 2)
+
+    def test_a_token_that_is_already_cancelled_costs_no_time_at_all(self):
+        token = CancelToken()
+        token.cancel()
+        with FakePC([OLD]) as pc, mock.patch.object(verify, "SETTLE_SECONDS", 30):
+            started = time.monotonic()
+            v = verify.check(OLD, Snapshot([OLD]), OK, "2.0", cancel=token)
+        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual((v.kind, pc.reads), ("unchanged", 1))
+
+    def test_an_installer_that_only_said_the_app_is_there_is_not_waited_for(self):
+        for kind in ("already_installed", "newer_present"):
+            ticks = iter(range(100))
+            fake_time = mock.Mock(monotonic=lambda: next(ticks), sleep=mock.Mock())
+            with FakePC([OLD], [entry(OLD.reg_key, "2.0")]) as pc, mock.patch.object(verify, "SETTLE_SECONDS", 5), \
+                 mock.patch.object(verify, "time", fake_time):
+                v = verify.check(OLD, Snapshot([OLD]), Outcome(kind), "2.0")
+            self.assertEqual((v.kind, pc.reads), ("unchanged", 1), kind)
+            fake_time.sleep.assert_not_called()
+
     def test_unreadable_registry_trusts_the_expected_version(self):
         with mock.patch.object(verify, "read_installed_apps", side_effect=OSError("denied")), \
              mock.patch.object(verify, "_pending_flags", lambda: {}), mock.patch.object(verify, "SETTLE_SECONDS", 0), \
@@ -187,6 +228,22 @@ class RestartTest(unittest.TestCase):
         v = judge([OLD, entry(r"HKLM64\{NEW}", "2.0")], Outcome("restart"))
         self.assertEqual(v.kind, "side_by_side")
 
+    def test_an_unrelated_new_flag_does_not_turn_a_failed_install_into_a_restart(self):
+        # Exit 0, the registry still lists the old version, and Windows Update asked for a restart meanwhile.
+        for flags in ({"windows update": 1}, {"file operations": 4}):
+            v = judge([OLD], flags=flags)
+            self.assertEqual((v.kind, v.version, v.ok), ("unchanged", "1.0", False), flags)
+
+    def test_a_new_flag_does_not_rescue_an_installer_that_only_said_the_app_is_already_there(self):
+        for kind in ("already_installed", "newer_present"):
+            self.assertEqual(judge([OLD], Outcome(kind), flags={"servicing": 1}).kind, "unchanged", kind)
+            v = judge([entry(OLD.reg_key, "2.0")], Outcome(kind), flags={"servicing": 1})
+            self.assertEqual((v.kind, v.ok), ("installed", True), kind)
+
+    def test_the_exit_code_alone_is_enough_for_a_restart_even_when_the_registry_is_unchanged(self):
+        v = judge([OLD], Outcome("restart"), flags={})
+        self.assertEqual((v.kind, v.ok), ("restart", True))
+
 
 class UnknownTest(unittest.TestCase):
     def test_store_or_winget_only_rows_trust_the_expected_version(self):
@@ -210,7 +267,7 @@ class OrderTest(unittest.TestCase):
     def test_moved_on(self):
         cases = [
             ("2.0", "1.0", True), ("1.0", "2.0", False), ("1.2.3.0", "1.2.3", False),
-            ("1.2.3", "1.2.3-beta.1", True), ("1.2.3a", "1.2.3", True),
+            ("1.2.3", "1.2.3-beta.1", True), ("1.1.1k", "1.1.1", True), ("1.2.3a", "1.2.3", False),
             ("2024.03.1", "1.0", True),            # another numbering scheme: the text changed
             ("2.0", "", True), ("", "2.0", False),
             ("latest", "2.0", False),              # no number to go by

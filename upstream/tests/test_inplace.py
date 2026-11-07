@@ -188,6 +188,54 @@ class InstalledKindTest(unittest.TestCase):
             self.assertEqual(detect.call_count, 2)
 
 
+class RegistryVersusUninstallerTest(unittest.TestCase):
+    """The registry kind is cross-checked with the uninstaller file. Eitaa Desktop has a {GUID}_is1 key, so the
+    registry says Inno Setup, but its Uninstall.exe is NSIS."""
+    NSIS = b"MZ" + bytes(100) + b"Nullsoft.NSIS" + bytes(50)
+    INNO = b"MZ" + bytes(100) + b"Inno Setup" + bytes(50)
+
+    def setUp(self):
+        inplace._sniffed.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def app(self, kind: str, data: bytes | None, name="Uninstall.exe") -> InstalledApp:
+        extra = {}
+        if data is not None:
+            extra["uninstall_string"] = f'"{touch(self.root / "Eitaa" / name, data)}"'
+        return make_app(kind, reg_key=rf"HKCU\{NEW}_is1", **extra)
+
+    def test_a_disagreeing_uninstaller_makes_the_kind_unknown(self):
+        self.assertEqual(inplace.installed_kind(self.app("inno", self.NSIS)), "")
+        self.assertEqual(inplace.installed_kind(self.app("nullsoft", self.INNO, "unins000.exe")), "")
+
+    def test_an_agreeing_uninstaller_confirms_the_registry(self):
+        self.assertEqual(inplace.installed_kind(self.app("inno", self.INNO, "unins000.exe")), "inno")
+        self.assertEqual(inplace.installed_kind(self.app("nullsoft", self.NSIS)), "nullsoft")
+
+    def test_an_uninstaller_that_says_nothing_leaves_the_registry_kind(self):
+        self.assertEqual(inplace.installed_kind(self.app("inno", b"MZ" + bytes(64))), "inno")
+        self.assertEqual(inplace.installed_kind(self.app("inno", b"not a program")), "inno")
+        self.assertEqual(inplace.installed_kind(self.app("inno", None)), "inno")
+        missing = make_app("inno", uninstall_string=f'"{self.root / "gone" / "Uninstall.exe"}"')
+        self.assertEqual(inplace.installed_kind(missing), "inno")
+
+    def test_msi_is_not_second_guessed_by_msiexec(self):
+        app = make_app("msi", uninstall_string=f"MsiExec.exe /X{NEW}")
+        self.assertEqual(inplace.installed_kind(app), "msi")
+
+    def test_eitaa_gets_its_nsis_update_instead_of_a_second_copy_refusal(self):
+        app = self.app("inno", self.NSIS)
+        plan = inplace.plan(app, "nullsoft", Path("setup.exe"))
+        self.assertEqual((plan.extra_args, plan.refuse, plan.warnings), ("", None, []))
+
+    def test_a_real_mismatch_is_still_refused(self):
+        app = self.app("inno", self.INNO, "unins000.exe")
+        self.assertIsNotNone(inplace.plan(app, "nullsoft", Path("setup.exe")).refuse)
+        self.assertIsNone(inplace.plan(app, "inno", Path("setup.exe")).refuse)
+
+
 class MismatchTest(unittest.TestCase):
     def outcome(self, installed: str, new: str):
         plan = inplace.plan(make_app(installed), new, Path("setup.exe"))

@@ -5,7 +5,8 @@ before the installer runs; check() reads them again and decides:
 
     installed     the entry for this app, or its replacement under a new key, shows a newer version
     side_by_side  a second entry with the newer version appeared and the old one is still listed
-    restart       the installer asked for one (3010 / 1641), or a pending-restart flag is new
+    restart       the installer asked for one (3010 / 1641), or the version changed and a pending-restart flag is new
+                  (a flag alone proves nothing: it may belong to Windows Update or another program)
     unchanged     the installer returned success but Windows still lists the old version (ok=False)
     unknown       nothing to read (a Store or winget-only row, or no entry left): the expected version is trusted"""
 from __future__ import annotations
@@ -15,6 +16,7 @@ import time
 import winreg
 from dataclasses import dataclass, field
 
+from .context import CancelToken
 from .exitcodes import Outcome
 from .inventory import InstalledApp, read_installed_apps
 from .versioning import compare, parse_version
@@ -129,15 +131,22 @@ def _restart_flag_is_new(before: Snapshot) -> bool:
     return any(count > before.pending.get(name, 0) for name, count in _pending_flags().items())
 
 
-def check(app: InstalledApp, before: Snapshot, outcome: Outcome, expected_version: str) -> Verdict:
+def check(app: InstalledApp, before: Snapshot, outcome: Outcome, expected_version: str,
+          cancel: CancelToken | None = None) -> Verdict:
+    """Cancelling ends the settle wait at once; the verdict then rests on what the registry shows now."""
     expected = expected_version or app.version
     kind, entry = "unknown", None
     if not app.reg_key.startswith(STORE_PREFIX):
         try:
             kind, entry, _ = _inspect(app, before)
+            # Not for an installer that only said the app is already there: it started no hand-over to wait for.
+            settle = not outcome.restart and not outcome.present
             deadline = time.monotonic() + SETTLE_SECONDS
-            while kind == "unchanged" and not outcome.restart and time.monotonic() < deadline:
-                time.sleep(1)
+            while settle and kind == "unchanged" and time.monotonic() < deadline:
+                if cancel is None:
+                    time.sleep(1)
+                elif cancel.wait(1):
+                    break
                 kind, entry, _ = _inspect(app, before)
         except Exception:
             log.exception("%s: could not read the installed apps", app.name)
@@ -147,7 +156,9 @@ def check(app: InstalledApp, before: Snapshot, outcome: Outcome, expected_versio
     if kind == "side_by_side":
         return Verdict(kind, version, "Installed {version}, but the old copy of {name} is still there",
                        {"version": version, "name": app.name})
-    if outcome.restart or _restart_flag_is_new(before):
+    # 3010 / 1641 are enough on their own. A new flag is only believed when the version really changed, and not
+    # when the installer merely reported the app as already there: otherwise a failed install would pass as "restart".
+    if outcome.restart or (kind != "unchanged" and not outcome.present and _restart_flag_is_new(before)):
         return Verdict("restart", version, "Restart Windows to finish installing {version}", {"version": version})
     if kind == "unchanged":
         return Verdict(kind, entry.version, "Installer finished, but Windows still reports {version}",

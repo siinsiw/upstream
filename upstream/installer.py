@@ -11,7 +11,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Callable
 
-from .errors import Cancelled, InstallError  # noqa: F401 - re-exported
+from .errors import Cancelled, InstallError, StoppedWaiting  # noqa: F401 - re-exported
 
 log = logging.getLogger("upstream.installer")
 
@@ -53,15 +53,29 @@ def common_name(subject: str) -> str:
     return m.group(1).replace('""', '"') if m.group(1) is not None else m.group(2).strip()
 
 
+def _system_tool(name: str, *folders: str) -> str:
+    """Full path of a tool in System32, so a lookalike in the current folder or on PATH can't stand in for it.
+    The bare name is the fallback when the file isn't there."""
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    tool = Path(root, "System32", *folders, name)
+    return str(tool) if tool.is_file() else name
+
+
+def _powershell(script: str, path: Path) -> tuple[list[str], dict[str, str]]:
+    """The command line and environment that run `script` with the file's path in $env:UPSTREAM_PATH.
+    The path never appears in the script text: PowerShell treats the curly quotes U+2018 to U+201B like
+    ', so a folder name could end the string early and run its own commands."""
+    command = [_system_tool("powershell.exe", "WindowsPowerShell", "v1.0"), "-NoProfile", "-NonInteractive",
+               "-Command", "[Console]::OutputEncoding = [Text.Encoding]::UTF8; " + script]
+    return command, {**os.environ, "UPSTREAM_PATH": str(path)}
+
+
 def signature(path: Path) -> tuple[str, str]:
     """(status, signer) from Authenticode. Status is Valid, NotSigned, HashMismatch, ..."""
-    literal = str(path).replace("'", "''")
-    script = ("[Console]::OutputEncoding = [Text.Encoding]::UTF8; "
-              f"$s = Get-AuthenticodeSignature -LiteralPath '{literal}'; "
-              "\"$($s.Status)|$($s.SignerCertificate.Subject)\"")
+    command, env = _powershell("$s = Get-AuthenticodeSignature -LiteralPath $env:UPSTREAM_PATH; "
+                               "\"$($s.Status)|$($s.SignerCertificate.Subject)\"", path)
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+        r = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=60, creationflags=CREATE_NO_WINDOW)
         status, _, signer = (r.stdout or "").strip().partition("|")
         return status or "Unknown", common_name(signer) if signer else ""
@@ -127,10 +141,10 @@ def _wait_for(finished: Callable[[float], bool], cancel=None, timeout_min: float
     deadline = time.monotonic() + timeout_min * 60 if timeout_min else None
     while not finished(_SLICE):
         if cancel is not None and cancel.is_set:
-            raise Cancelled("Stopped waiting for the installer. It may still be running.")
+            raise StoppedWaiting("Stopped waiting for the installer. It may still be running.")
         if deadline is not None and time.monotonic() >= deadline:
-            raise Cancelled("The installer was still running after {minutes} minutes, so Upstream stopped "
-                            "waiting for it. It may still be running.", minutes=f"{timeout_min:g}")
+            raise StoppedWaiting("The installer was still running after {minutes} minutes, so Upstream stopped "
+                                 "waiting for it. It may still be running.", minutes=f"{timeout_min:g}")
 
 
 def _shell_run(file: str, params: str, show: int = 1, cancel=None, timeout_min: float | None = None) -> int:
@@ -180,14 +194,15 @@ def _exited(proc: subprocess.Popen, seconds: float) -> bool:
 def _add_appx(path: Path, cancel, timeout_min: float | None) -> int:
     if cancel is not None:
         cancel.check()
-    literal = str(path).replace("'", "''")
-    proc = subprocess.Popen(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                             f"Add-AppxPackage -Path '{literal}' -ForceApplicationShutdown"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-                            creationflags=CREATE_NO_WINDOW)
+    # Add-AppxPackage has no -LiteralPath and reads [ ] * ? in -Path as wildcards (a folder named "a[1]" would
+    # match nothing and "succeed"), so the path is escaped.
+    command, env = _powershell("Add-AppxPackage -Path ([WildcardPattern]::Escape($env:UPSTREAM_PATH)) "
+                               "-ForceApplicationShutdown", path)
+    proc = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW)
     _wait_for(lambda seconds: _exited(proc, seconds), cancel, timeout_min)
     if proc.returncode:
-        detail = proc.stderr.read().strip().splitlines()[:1]
+        detail = ((proc.stderr.read() if proc.stderr else "") or "").strip().splitlines()[:1]
         if detail:
             raise InstallError("Couldn't install the MSIX package: {error}", error=detail[0])
         raise InstallError("Couldn't install the MSIX package.")
@@ -197,13 +212,14 @@ def _add_appx(path: Path, cancel, timeout_min: float | None) -> int:
 def install(path: Path, kind: str, scope: str, plan=None, cancel=None) -> int:
     """Run the installer and return its exit code. `plan` (inplace.InstallPlan) adds switches that
     keep the update in the app's existing folder; `cancel` (context.CancelToken) lets the user stop
-    waiting, and install_timeout_min does the same after a while: either way Cancelled is raised and the
+    waiting, and install_timeout_min does the same after a while: either way StoppedWaiting is raised and the
     installer is left running."""
     extra = f" {plan.extra_args}" if plan is not None and plan.extra_args else ""
     limit = timeout_minutes()
     if kind == "msi":
         # /passive: progress bar only, and unlike /qn it can raise UAC itself.
-        return _shell_run("msiexec.exe", f'/i "{path}" /passive /norestart{extra}', cancel=cancel, timeout_min=limit)
+        return _shell_run(_system_tool("msiexec.exe"), f'/i "{path}" /passive /norestart{extra}',
+                          cancel=cancel, timeout_min=limit)
     if kind == "msix":
         return _add_appx(path, cancel, limit)
     params = SILENT_ARGS.get(kind, "")

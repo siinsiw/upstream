@@ -59,12 +59,14 @@ class JsonStore:
             self.data[key] = value
 
     def save(self):
+        # One lock across serialise + write + replace: a worker thread (trust.remember) and the UI thread
+        # both save, and two writers sharing the .tmp file would leave a torn settings.json.
         with self.lock:
             text = json.dumps(self.data, ensure_ascii=False, indent=2)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(text, "utf-8")
-        os.replace(tmp, self.path)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(text, "utf-8")
+            os.replace(tmp, self.path)
 
 
 class Settings(JsonStore):
@@ -83,6 +85,7 @@ class Settings(JsonStore):
             # --- install safety (wave 1) ---
             "publisher_policy": "ask",        # ask | block | off: an update signed by a different publisher
             "signers": {},                    # ident -> certificate CN last seen on a verified install
+            "signers_approved": {},           # ident -> [CN]: signers the user accepted after a warning
             "close_apps_policy": "ask",       # ask | auto | never: running app that an update would replace
             "proxy": {"mode": "system", "url": ""},   # system | none | custom
             "metered_policy": "ask",          # ask | skip | ignore: downloading on a metered connection

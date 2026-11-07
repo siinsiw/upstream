@@ -73,14 +73,18 @@ def _sniff(program: str) -> str:
 
 def installed_kind(app: InstalledApp) -> str:
     """Installer framework of the copy already on the PC (msi, inno, nullsoft, burn, ...), '' if unknown.
-    The scan fills install_kind from the registry; the rest is read here, once, from the uninstaller file
-    (NSIS leaves nothing in the registry, and reading every uninstaller at scan time would be slow)."""
-    if app.install_kind and app.install_kind != "exe":
-        return app.install_kind
-    if app.reg_key.startswith(STORE_PREFIX):
+    The scan fills install_kind from the registry; the uninstaller file is read here, once per file (NSIS
+    leaves nothing in the registry, and reading every uninstaller at scan time would be slow). When the two
+    disagree the answer is '': a {GUID}_is1 key beside an NSIS Uninstall.exe (Eitaa Desktop) is a leftover
+    of one framework, and guessing would refuse an update that is fine."""
+    registry = "" if app.install_kind == "exe" else app.install_kind
+    if not registry and app.reg_key.startswith(STORE_PREFIX):
         return "msix"
     program = _uninstaller(app)
-    return _sniff(program) if program else ""
+    sniffed = _sniff(program) if program else ""
+    if registry and sniffed and registry != sniffed:
+        return ""
+    return registry or sniffed
 
 
 def _install_folder(app: InstalledApp) -> str:
@@ -208,7 +212,7 @@ def _plan_msi(app: InstalledApp, path: Path) -> InstallPlan:
     plan = InstallPlan()
     values = {"name": app.name}
     if app.scope == "machine" and not package["allusers"]:
-        plan.warnings.append((N_("The installed copy of {name} is for all users, but this installer sets up the "
+        plan.warnings.append((N_("The installed copy of {name} is for all users, but this installer sets the app up for the "
                                  "current user only. The update may end up as a second copy."), values))
     elif app.scope == "user" and package["allusers"] == "1":
         plan.warnings.append((N_("The installed copy of {name} is for the current user only, but this installer "

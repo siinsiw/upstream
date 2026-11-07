@@ -133,8 +133,8 @@ FA = {
     "Version pattern not found on the page": "الگوی نسخه در صفحه پیدا نشد",
     # installer / updater
     "The download's SHA-256 doesn't match the hash GitHub published; nothing was installed.":
-        "هش فایل دانلودشده با هشی که GitHub اعلام کرده یکی نیست؛ چیزی نصب نشد.",
-    "The downloaded file is not a Windows installer.": "فایل دانلودشده نصب‌کنندهٔ ویندوز نیست.",
+        "هش فایل دانلود‌شده با هشی که GitHub اعلام کرده یکی نیست؛ چیزی نصب نشد.",
+    "The downloaded file is not a Windows installer.": "فایل دانلود‌شده نصب‌کنندهٔ ویندوز نیست.",
     "Administrator permission (UAC) was declined.": "اجازهٔ مدیر سیستم (UAC) داده نشد.",
     "Couldn't start the installer (Windows error {code}).": "اجرای نصب‌کننده ممکن نشد (خطای ویندوز {code}).",
     "No source for an automatic download": "منبعی برای دانلود خودکار پیدا نشد",

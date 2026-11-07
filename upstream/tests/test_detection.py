@@ -23,6 +23,9 @@ def make_app(name="Demo", version="1.0", publisher="Demo Inc", scope="machine", 
                         scope=scope, arch=arch, install_kind=install_kind, is_msi=is_msi, **extra)
 
 
+TELEGRAM_FA = "".join(map(chr, (0x62A, 0x644, 0x6AF, 0x631, 0x627, 0x645)))   # Telegram in Persian: no Latin letters at all
+
+
 def assets(*names):
     return [Asset(n, f"https://example.invalid/{n}", 1000, None) for n in names]
 
@@ -85,10 +88,26 @@ class VersionOrderTest(unittest.TestCase):
         ("1.2.3_x64", "1.2.3", 0),
         ("1.2.3-windows-x64", "1.2.4", -1),
         ("1.2.3 (Build 456)", "1.2.3", 0),
-        # trailing letters
-        ("1.2.3a", "1.2.3", 1),
+        # trailing letters: a and b are alpha and beta, any other letter after three numbers is OpenSSL's patch level
+        ("1.2.3a", "1.2.3", -1),
+        ("1.2.3b", "1.2.3", -1),
         ("1.2.3b", "1.2.3a", 1),
         ("1.2.4", "1.2.3b", 1),
+        ("1.2.3-b", "1.2.3", -1),
+        ("1.2.3_a", "1.2.3-b", -1),
+        ("1.2.3-b2", "1.2.3-b10", -1),
+        ("1.1.1k", "1.1.1", 1),
+        ("1.1.1w", "1.1.1k", 1),
+        ("1.1.2", "1.1.1w", 1),
+        ("1.1.1-k", "1.1.1", 0),
+        ("2.0k", "2.0", 0),
+        # Windows resource files write file versions with commas
+        ("5.1.2", "5, 1, 2, 0", 0),
+        ("1.2.3", "1,2,3", 0),
+        ("1.2.4", "1,2,3", 1),
+        ("5.1.2.1", "5, 1, 2, 0", 1),
+        ("5, 1, 2, 0", "5, 1, 3, 0", -1),
+        ("2024, 3, 1", "2024.3.1", 0),
         ("3.13.0a1", "3.13.0b1", -1),
         ("3.13.0b2", "3.13.0rc1", -1),
         ("3.13.0rc1", "3.13.0", -1),
@@ -153,9 +172,23 @@ class VersionOrderTest(unittest.TestCase):
     def test_parse_version_keeps_the_numeric_core(self):
         for text, core in [("Git 2.51.0.windows.1", (2, 51)), ("3.9.0+38", (3, 9)), ("v1.2.3.0", (1, 2, 3)),
                            ("Notepad++ v8.8.3", (8, 8, 3)), ("2024-03-14", (2024, 3, 14)), ("7", (7,)),
-                           ("17.11-1", (17, 11, 1)), ("latest", None), ("", None), (None, None)]:
+                           ("17.11-1", (17, 11, 1)), ("5, 1, 2, 0", (5, 1, 2)), ("1,2,3", (1, 2, 3)),
+                           ("1,5", (1,)), ("latest", None), ("", None), (None, None)]:
             with self.subTest(text=text):
                 self.assertEqual(parse_version(text), core)
+
+    def test_an_installed_version_with_commas_is_never_an_update_over_itself(self):
+        for candidate, installed in [("5.1.2", "5, 1, 2, 0"), ("1.2.3", "1,2,3"), ("1.2.3.4", "1, 2, 3, 4")]:
+            with self.subTest(installed=installed):
+                self.assertFalse(is_newer(candidate, installed))
+                self.assertTrue(same_version(candidate, installed))
+        self.assertTrue(is_newer("5.1.3", "5, 1, 2, 0"))
+
+    def test_a_lone_comma_is_left_alone_and_dots_win_over_commas(self):
+        self.assertEqual(parse_version("1,5"), (1,))
+        self.assertEqual(parse_version("1.5, 2"), (1, 5))
+        self.assertEqual(clean("v5, 1, 2, 0"), "5.1.2.0")
+        self.assertEqual(clean("1,5"), "1,5")
 
     def test_clean_cuts_the_prefix_only(self):
         for text, shown in [("v8.8.3", "8.8.3"), ("spotube-v5.1.2", "5.1.2"), ("release-2024-03-14", "2024-03-14"),
@@ -164,9 +197,10 @@ class VersionOrderTest(unittest.TestCase):
                 self.assertEqual(clean(text), shown)
 
     def test_prerelease_detection(self):
-        for text in ("1.2.3-beta.1", "3.13.0rc1", "3.13.0a1", "2.0-preview", "1.0.0-dev"):
+        for text in ("1.2.3-beta.1", "3.13.0rc1", "3.13.0a1", "2.0-preview", "1.0.0-dev", "1.2.3b", "v1.2.3a",
+                     "1.2.3-b", "1.2.3b2"):
             self.assertTrue(is_prerelease(text), text)
-        for text in ("1.2.3", "1.2.3a", "2.51.0.windows.1", "v8.8.3", "1.2.3-windows", ""):
+        for text in ("1.2.3", "1.1.1k", "1.0.2u", "2.51.0.windows.1", "v8.8.3", "1.2.3-windows", "1.2.3-x64", ""):
             self.assertFalse(is_prerelease(text), text)
 
 
@@ -237,6 +271,48 @@ class RepoRankingTest(unittest.TestCase):
                 "https://github.com/git-for-windows/git/releases/download/v2.51.0.windows.1/Git-2.51.0-64-bit.exe"]
         self.assertEqual(self.best("Git", "The Git Development Community", "Git.Git", urls),
                          ["git-for-windows/git", "git/git"])
+
+    def test_an_app_without_latin_letters_is_matched_by_publisher_download_or_the_only_repo(self):
+        telegram = "https://github.com/telegramdesktop/tdesktop"
+        cases = [
+            ("the only repo the links name", TELEGRAM_FA, "Telegram FZ-LLC", [f"{telegram}/releases"],
+             ["telegramdesktop/tdesktop"]),
+            ("the same repo linked twice is still one", TELEGRAM_FA, "Telegram FZ-LLC",
+             [f"{telegram}/releases", f"{telegram}/issues"], ["telegramdesktop/tdesktop"]),
+            ("a download from the publisher's owner wins", "テレグラム", "Acme Inc",
+             ["https://github.com/other/thing", "https://github.com/acme/desk/releases/download/v1/setup.exe"],
+             ["acme/desk"]),
+            ("two repos and no evidence", TELEGRAM_FA, "Telegram FZ-LLC", [telegram, "https://github.com/foo/bar"], []),
+            ("a download from an unrelated owner is not enough", TELEGRAM_FA, "Telegram FZ-LLC",
+             [telegram, "https://github.com/foo/bar/releases/download/v1/x.exe"], []),
+            ("docs are not the app even when alone", TELEGRAM_FA, "Acme", ["https://github.com/acme/docs"], []),
+            ("another platform's repo is not the app", TELEGRAM_FA, "Acme", ["https://github.com/acme/acme-android"], []),
+            ("only the usable repo counts as alone", TELEGRAM_FA, "Acme",
+             ["https://github.com/acme/acme-docs", "https://github.com/acme/desk"], ["acme/desk"]),
+        ]
+        for label, name, publisher, urls, expected in cases:
+            with self.subTest(label):
+                self.assertEqual(self.best(name, publisher, None, urls), expected)
+
+    def test_a_winget_id_gives_a_non_latin_app_its_name_back(self):
+        urls = ["https://github.com/telegramdesktop/tdesktop/releases", "https://github.com/foo/bar"]
+        self.assertEqual(self.best(TELEGRAM_FA, "Telegram FZ-LLC", "Telegram.TelegramDesktop", urls),
+                         ["telegramdesktop/tdesktop"])
+
+    def test_app_installer_is_built_in_winget_cli(self):
+        download = ("https://github.com/microsoft/winget-cli/releases/download/v1.7.10861/"
+                    "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle")
+        name, publisher, winget_id = "App Installer", "Microsoft Corporation", "Microsoft.AppInstaller"
+        self.assertEqual(self.best(name, publisher, winget_id, [download]), ["microsoft/winget-cli"])
+        self.assertEqual(self.best(name, publisher, winget_id, ["https://github.com/microsoft/winget-cli"]), [],
+                         "a homepage link alone is not proof")
+        self.assertEqual(self.best("Foo", "Foo Inc", "Foo.Foo", ["https://github.com/foo/winget-helper/issues"]), [])
+        self.assertEqual(self.best("Foo", "Foo Inc", "Foo.Foo",
+                                   ["https://github.com/other/winget-foo/releases/download/v1/x.exe"]), [],
+                         "the penalty is lifted, but the repo still has to look like the app")
+        self.assertEqual(self.best("Winget Helper", "Foo Inc", "Foo.winget-helper",
+                                   ["https://github.com/foo/winget-helper"]), ["foo/winget-helper"],
+                         "the app's own id says winget")
 
     def test_no_github_link_no_repo(self):
         self.assertEqual(self.best("Python 3.12.4 (64-bit)", "Python Software Foundation", "Python.Python.3.12",
@@ -328,6 +404,20 @@ class CheckTest(unittest.TestCase):
         res = self.check([api_release("v1.2.3", ["demo-setup.exe"])], make_app(version="1.2.3-beta.1"))
         self.assertEqual(res.release.version, "1.2.3")
 
+    def test_a_beta_tag_without_the_prerelease_flag_is_not_an_update(self):
+        releases = [api_release("v1.2.3b", ["demo-setup.exe"]), api_release("v1.2.3", ["demo-setup.exe"])]
+        self.assertIsNone(self.check(releases[:1], make_app(version="1.2.3")).release)
+        self.assertEqual(self.check(releases, make_app(version="1.2.3b")).release.version, "1.2.3")
+        self.assertIsNone(self.check(releases[:1], make_app(version="1.2.2")).release,
+                          "a beta is not offered unless pre-releases are asked for")
+        res = self.check(releases[:1], make_app(version="1.2.2"), client={"include_prereleases": True})
+        self.assertEqual(res.release.version, "1.2.3b")
+
+    def test_an_openssl_style_patch_letter_is_an_update(self):
+        release = [api_release("1.1.1k", ["demo-setup.exe"])]
+        self.assertEqual(self.check(release, make_app(version="1.1.1")).release.version, "1.1.1k")
+        self.assertIsNone(self.check(release, make_app(version="1.1.1k")).asset)
+
     def test_other_numbering_scheme_is_not_compared(self):
         releases = [api_release("2026.11.02", ["demo-setup.exe"]), api_release("v8.0.2", ["demo-setup.exe"])]
         res = self.check(releases, make_app(version="8.0.1"))
@@ -394,6 +484,22 @@ class PickAssetTest(unittest.TestCase):
         wide = ["Foo-1.2-user-x64.exe", "Foo-1.2-all-users-x64.exe"]
         self.assertEqual(self.name(wide, make_app("Foo", scope="machine")), "Foo-1.2-all-users-x64.exe")
         self.assertEqual(self.name(wide, make_app("Foo", scope="user")), "Foo-1.2-user-x64.exe")
+
+    def test_admin_and_system_in_a_name_say_nothing_about_the_scope(self):
+        admin = ["pgadmin4-8.0-admin-x64.exe", "pgadmin4-8.0-x64.exe"]
+        self.assertEqual(self.name(admin[::-1], make_app("pgAdmin 4", scope="machine")), "pgadmin4-8.0-x64.exe")
+        for scope in ("machine", "user"):
+            with self.subTest(scope=scope):
+                self.assertEqual(self.name(admin, make_app("pgAdmin 4", scope=scope)), admin[0],
+                                 "the scope is not what decides between them")
+        self.assertEqual(self.name(["Foo-x64.exe", "Foo-system-x64.exe"], make_app("Foo", scope="machine")), "Foo-x64.exe")
+
+    def test_machine_wide_words_still_count(self):
+        for word in ("allusers", "all-users", "perMachine", "per_machine", "machine", "system-wide", "SystemWide"):
+            wide = [f"Foo-1.2-{word}-x64.exe", "Foo-1.2-user-x64.exe"]
+            with self.subTest(word=word):
+                self.assertEqual(self.name(wide, make_app("Foo", scope="machine")), wide[0])
+                self.assertEqual(self.name(wide, make_app("Foo", scope="user")), wide[1])
 
     def test_portable_symbols_and_archives_are_never_picked(self):
         junk = ["Foo-portable.exe", "Foo-symbols.zip", "Foo.zip", "Foo-debug.exe", "Foo-1.2.7z", "Foo-pdb.exe",
@@ -585,6 +691,35 @@ class ScannerTest(unittest.TestCase):
         urls, winget_id, arch = sc._gh.discovered[0]
         self.assertEqual(urls, ["https://foo.example/", "https://github.com/foo/foo/issues", "https://github.com/foo/foo/releases"])
         self.assertEqual((winget_id, status.repo), ("Foo.Foo", "auto/detected"))
+
+    def test_the_winget_installer_url_joins_the_links_given_to_discovery(self):
+        installer = "https://github.com/foo/foo/releases/download/v2/Foo-2-x64.exe"
+        for label, meta_installer, expected_tail in [
+            ("a GitHub download is appended", installer, [installer]),
+            ("a link already among the links is not repeated", "https://github.com/foo/foo/wiki", []),
+            ("another host is left out", "https://cdn.example.com/Foo-2-x64.exe", []),
+            ("no installer URL", None, []),
+        ]:
+            with self.subTest(label):
+                app = make_app("Foo", urls=["https://foo.example/"])
+                sc = self.scanner()
+                sc.cache.put("winget_meta", "Foo.Foo", {"v": winget.META_VERSION, "installer_url": meta_installer,
+                                                        "urls": ["https://github.com/foo/foo/wiki"]})
+                sc.resolve(AppStatus(app, winget_id="Foo.Foo"), False)
+                self.assertEqual(sc._gh.discovered[0][0],
+                                 ["https://foo.example/", "https://github.com/foo/foo/wiki", *expected_tail])
+
+    def test_app_installer_finds_winget_cli_through_the_installer_url_alone(self):
+        installer = ("https://github.com/microsoft/winget-cli/releases/download/v1.7.10861/"
+                     "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle")
+        sc = self.scanner(github=github_with({"microsoft/winget-cli": []}))
+        sc.cache.put("winget_meta", "Microsoft.AppInstaller",
+                     {"v": winget.META_VERSION, "urls": [], "installer_url": installer})
+        app = make_app("App Installer", "1.22", "Microsoft Corporation", reg_key=r"WINGET\Microsoft.AppInstaller")
+        status = AppStatus(app, winget_id="Microsoft.AppInstaller")
+        sc.resolve(status, False)
+        self.assertEqual(status.repo, "microsoft/winget-cli")
+        self.assertEqual(sc._gh.calls, ["microsoft/winget-cli"], "one release listing, none to choose a repo")
 
     def test_no_repo_means_no_github_check(self):
         sc = self.scanner(github=RecordingGitHub(found=None))

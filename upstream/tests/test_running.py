@@ -221,6 +221,50 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(wait.call_count, 1)       # only the check after the forced termination
         self.assertEqual(wait.call_args.args[2], running.KILL_SECONDS)
 
+    def test_a_cancelled_update_closes_nothing_under_any_policy(self):
+        for policy in ("auto", "ask", "never", "whatever"):
+            ctx, asker = make_ctx(policy, True, True)
+            ctx.cancel.cancel()
+            post, terminate = mock.Mock(return_value=1), mock.Mock()
+            with self.subTest(policy=policy), self.patched(find_running=mock.Mock(return_value=self.procs),
+                                                           _post_close=post, _terminate=terminate):
+                with self.assertRaises(Cancelled) as raised:
+                    running.close_for_update(ctx, self.app, self.progress)
+                self.assertEqual(raised.exception.template, "Cancelled.")
+                self.assertEqual(asker.questions, [])
+                post.assert_not_called()
+                terminate.assert_not_called()
+        self.progress.assert_not_called()
+
+    def test_cancelling_during_the_question_never_posts_a_close(self):
+        ctx, _ = make_ctx("ask")
+        ctx.ask = lambda *args, **values: ctx.cancel.cancel() or True       # the answer arrives after the cancel
+        post = mock.Mock(return_value=1)
+        with self.patched(_post_close=post):
+            with self.assertRaises(Cancelled):
+                running.close_for_update(ctx, self.app, self.progress)
+        post.assert_not_called()
+
+    def test_cancelling_after_the_scan_never_posts_a_close(self):
+        ctx, _ = make_ctx("auto")
+        post = mock.Mock(return_value=1)
+        # The user cancels while find_running() is still looking: the check right before WM_CLOSE stops it.
+        with self.patched(find_running=lambda app: ctx.cancel.cancel() or self.procs, _post_close=post):
+            with self.assertRaises(Cancelled):
+                running.close_for_update(ctx, self.app, self.progress)
+        post.assert_not_called()
+
+    def test_cancelling_before_the_force_never_terminates(self):
+        ctx, _ = make_ctx("auto")
+        asked = []
+        ctx.ask = lambda *args, **values: asked.append(args) or ctx.cancel.cancel() or True
+        terminate = mock.Mock()
+        with self.patched(_wait_gone=lambda ctx, procs, seconds: self.procs, _terminate=terminate):
+            with self.assertRaises(Cancelled):
+                running.close_for_update(ctx, self.app, self.progress)
+        self.assertEqual(len(asked), 1)
+        terminate.assert_not_called()
+
     def test_long_process_lists_are_shortened(self):
         many = [running.RunningProcess(i, f"p{i:02}.exe", rf"C:\x\p{i:02}.exe") for i in range(12)]
         text = running._names(many)
@@ -244,16 +288,6 @@ class RootsTest(unittest.TestCase):
             self.assertEqual(running.find_running(make_app("")), [])
             self.assertEqual(running.find_running(make_app("relative\\folder")), [])
 
-    def test_the_app_folder_is_used(self):
-        folder = os.path.join(os.environ["ProgramFiles"], "Demo App")
-        self.assertEqual(running.install_roots(make_app(folder + "\\")), [guard.normalize(folder)])
-
-    def test_icon_and_uninstaller_folders_fill_in_when_there_is_no_location(self):
-        folder = os.path.join(os.environ["ProgramFiles"], "Demo App")
-        app = make_app("", uninstall_string=f'"{folder}\\unins000.exe" /SILENT',
-                       quiet_uninstall_string=f"{folder}\\unins000.exe /VERYSILENT")
-        self.assertEqual(running.install_roots(app), [guard.normalize(folder)])
-
     def test_windows_installer_commands_name_no_folder(self):
         app = make_app("", uninstall_string="MsiExec.exe /X{11111111-2222-3333-4444-555555555555}")
         self.assertEqual(running.install_roots(app), [])
@@ -264,6 +298,182 @@ class RootsTest(unittest.TestCase):
         self.assertEqual(running._program_of(r'"C:\A B\u.exe" /S'), r"C:\A B\u.exe")
         self.assertEqual(running._program_of(r"C:\A B\u.exe /S"), r"C:\A B\u.exe")
         self.assertEqual(running._program_of(""), "")
+
+    def test_direct_children_of_the_places_apps_are_installed_to(self):
+        program_files, local = os.environ["ProgramFiles"], os.environ["LOCALAPPDATA"]
+        yes = (os.environ["SystemDrive"] + "\\Tools", os.path.join(program_files, "JetBrains"),
+               os.path.join(os.environ["ProgramData"], "Foo"), os.path.join(local, "Programs", "Foo"))
+        no = (os.path.join(program_files, "JetBrains", "IDEA"), os.path.join(local, "Foo"),
+              os.environ["SystemDrive"] + "\\Tools\\Foo", os.path.join(local, "Programs", "Foo", "bin"))
+        for folder in yes:
+            with self.subTest(folder=folder):
+                self.assertTrue(running._direct_child(guard.normalize(folder)))
+        for folder in no:
+            with self.subTest(folder=folder):
+                self.assertFalse(running._direct_child(guard.normalize(folder)))
+
+    def test_steam_library_folders(self):
+        for folder in (r"D:\SteamLibrary\steamapps", r"C:\Program Files (x86)\Steam\steamapps\common"):
+            with self.subTest(folder=folder):
+                self.assertTrue(running._is_library(guard.normalize(folder)))
+        self.assertFalse(running._is_library(guard.normalize(r"C:\Program Files (x86)\Steam\steamapps\common\Game")))
+
+
+class SharedFolderTest(unittest.TestCase):
+    """Umbrella folders (C:\\Tools, Program Files\\JetBrains, a Steam library, a host program's folder) must not
+    count as 'the app's own', or an update would close the sibling apps living there. The folder trees are built
+    in a temp dir that these tests declare to be a place where apps are installed. No process is touched."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="upstream-roots-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.installed: list[tuple[str, str, list[str]]] = []
+        for patch in (exempt(self.tmp),
+                      mock.patch.object(running, "_umbrella_parents", lambda: {guard.normalize(self.tmp)}),
+                      mock.patch.object(running, "_installed_folders", lambda: self.installed)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def put(self, *files: str):
+        for rel in files:
+            path = Path(self.tmp, rel)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+
+    def at(self, rel: str) -> str:
+        return str(Path(self.tmp, rel))
+
+    def root(self, rel: str) -> str:
+        return guard.normalize(self.at(rel))
+
+    def test_a_folder_holding_two_apps_has_no_roots(self):
+        self.put("Tools/alpha/alpha.exe", "Tools/beta/beta.exe", "Tools/readme.txt")
+        self.assertEqual(running.install_roots(make_app(self.at("Tools"))), [])
+
+    def test_programs_one_level_deeper_count_too(self):
+        self.put("JetBrains/IDEA/bin/idea.exe", "JetBrains/PyCharm/bin/pycharm.exe")
+        self.assertEqual(running.install_roots(make_app(self.at("JetBrains"))), [])
+
+    def test_the_app_inside_the_umbrella_keeps_its_own_folder(self):
+        self.put("Tools/alpha/alpha.exe", "Tools/beta/beta.exe")
+        self.assertEqual(running.install_roots(make_app(self.at("Tools/alpha"))), [self.root("Tools/alpha")])
+
+    def test_a_leaf_folder_is_the_apps_root(self):
+        self.put("Demo App/demo.exe", "Demo App/data/model.bin", "Demo App/plugins/one/one.dll")
+        self.assertEqual(running.install_roots(make_app(self.at("Demo App") + "\\")), [self.root("Demo App")])
+
+    def test_one_helper_program_folder_does_not_make_a_leaf_an_umbrella(self):
+        self.put("Demo App/demo.exe", "Demo App/updater/update.exe", "Demo App/res/a.dll")
+        self.assertEqual(running.install_roots(make_app(self.at("Demo App"))), [self.root("Demo App")])
+
+    def test_icon_and_uninstaller_folders_fill_in_when_there_is_no_location(self):
+        self.put("Demo App/demo.exe", "Demo App/unins000.exe")
+        folder = self.at("Demo App")
+        app = make_app("", uninstall_string=f'"{folder}\\unins000.exe" /SILENT',
+                       quiet_uninstall_string=f"{folder}\\unins000.exe /VERYSILENT")
+        self.assertEqual(running.install_roots(app), [self.root("Demo App")])
+
+    def test_a_big_single_app_folder_stays_when_its_own_uninstaller_is_in_it(self):
+        # Git for Windows: several subfolders with programs, one app
+        self.put("Git/git-bash.exe", "Git/unins000.exe", "Git/bin/bash.exe", "Git/cmd/git.exe", "Git/usr/bin/ssh.exe")
+        folder = self.at("Git")
+        app = make_app(folder, uninstall_string=f'"{folder}\\unins000.exe"')
+        self.assertEqual(running.install_roots(app), [self.root("Git")])
+        icon = make_app(folder, icon_path=self.at("Git/git-bash.exe"))
+        self.assertEqual(running.install_roots(icon), [self.root("Git")])
+
+    def test_the_same_folder_without_such_a_file_is_not_trusted(self):
+        self.put("Git/git-bash.exe", "Git/bin/bash.exe", "Git/cmd/git.exe")
+        self.assertEqual(running.install_roots(make_app(self.at("Git"))), [])
+        deeper = make_app(self.at("Git"), uninstall_string=self.at("Git/bin/bash.exe"))     # not directly in it
+        self.assertEqual(running.install_roots(deeper), [self.root("Git/bin")])
+        missing = make_app(self.at("Git"), uninstall_string=self.at("Git/gone.exe"))
+        self.assertEqual(running.install_roots(missing), [])
+
+    def test_the_exception_needs_the_folder_to_be_the_install_location(self):
+        # a Steam-style row: no InstallLocation of its own, the icon belongs to the host program next to other apps
+        self.put("Host/host.exe", "Host/alpha/alpha.exe", "Host/beta/beta.exe")
+        app = make_app("", icon_path=self.at("Host/host.exe"), uninstall_string=f'"{self.at("Host/host.exe")}" --remove 7')
+        self.assertEqual(running.install_roots(app), [])
+
+    def test_a_steam_row_pointing_at_the_host_keeps_only_the_game_folder(self):
+        self.put("Steam/steam.exe", "Steam/steamapps/common/Game/game.exe")
+        game = self.at("Steam/steamapps/common/Game")
+        app = make_app(game, icon_path=self.at("Steam/steam.exe"),
+                       uninstall_string=f'"{self.at("Steam/steam.exe")}" steam://uninstall/7')
+        self.assertEqual(running.install_roots(app), [self.root("Steam/steamapps/common/Game")])
+        self.assertEqual(running.install_roots(make_app(self.at("Steam/steamapps/common"))), [])
+        self.assertEqual(running.install_roots(make_app(self.at("Steam/steamapps"))), [])
+
+    def test_an_installed_app_inside_the_folder_makes_it_shared(self):
+        self.put("Vendor/ProdA/bin/a.exe", "Vendor/vendor.exe")
+        self.installed = [("HKLM64\\ProdA", "proda", [self.root("Vendor/ProdA")])]
+        self.assertEqual(running.install_roots(make_app(self.at("Vendor"))), [])
+
+    def test_an_installed_app_with_the_same_folder_makes_it_shared(self):
+        self.put("Host/host.exe")
+        self.installed = [("HKLM64\\Host", "host", [self.root("Host")])]
+        app = make_app("", icon_path=self.at("Host/host.exe"))
+        self.assertEqual(running.install_roots(app), [])
+
+    def test_the_own_uninstaller_does_not_outvote_an_app_living_inside(self):
+        self.put("Vendor/unins000.exe", "Vendor/ProdA/a.exe")
+        self.installed = [("HKLM64\\ProdA", "proda", [self.root("Vendor/ProdA")])]
+        app = make_app(self.at("Vendor"), uninstall_string=self.at("Vendor/unins000.exe"))
+        self.assertEqual(running.install_roots(app), [])
+
+    def test_the_app_itself_and_apps_elsewhere_do_not_count(self):
+        self.put("Demo App/demo.exe")
+        self.installed = [("HKLM64\\Demo", "demo", [self.root("Demo App")]),                 # this very row
+                          ("HKCU\\Demo", "demo", [self.root("Demo App")]),                   # same app, other row
+                          ("HKLM64\\Other", "other", [self.root("Other"), r"C:\Elsewhere"])]
+        self.assertEqual(running.install_roots(make_app(self.at("Demo App"))), [self.root("Demo App")])
+
+    def test_folders_that_cannot_be_looked_at_are_not_trusted(self):
+        self.assertEqual(running.install_roots(make_app(self.at("Missing"))), [])
+
+    def test_only_children_of_install_places_are_judged_by_their_shape(self):
+        self.put("Outer/Inner/Demo/a/a.exe", "Outer/Inner/Demo/b/b.exe", "Outer/Inner/Demo/Demo.exe")
+        self.assertEqual(running.install_roots(make_app(self.at("Outer/Inner/Demo"))), [self.root("Outer/Inner/Demo")])
+
+
+class InstalledAppsCacheTest(unittest.TestCase):
+    """The list of installed apps behind the shared-folder check: read lazily, reused briefly, never fatal."""
+
+    def setUp(self):
+        patch = mock.patch.object(running, "_installed_cache", None)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_rows_hold_the_install_location_or_else_the_host_program_folders(self):
+        apps = [make_app(r"C:\Apps\One", reg_key="k1", name="One"),
+                make_app("", reg_key="k2", name="Two", icon_path=r"C:\Host\host.exe",
+                         uninstall_string=r'"C:\Host\uninst.exe" /x')]
+        with mock.patch.object(running.inventory, "read_installed_apps", return_value=apps):
+            rows = running._installed_folders()
+        self.assertEqual(rows, [("k1", "one", [guard.normalize(r"C:\Apps\One")]),
+                                ("k2", "two", [guard.normalize(r"C:\Host")])])
+
+    def test_the_list_is_reused_for_a_while_and_read_again_later(self):
+        read = mock.Mock(return_value=[make_app(r"C:\Apps\One")])
+        with mock.patch.object(running.inventory, "read_installed_apps", read):
+            running._installed_folders()
+            running._installed_folders()
+            self.assertEqual(read.call_count, 1)
+            with mock.patch.object(running, "INVENTORY_TTL", 0):
+                running._installed_folders()
+        self.assertEqual(read.call_count, 2)
+
+    def test_an_unreadable_registry_gives_an_empty_list_instead_of_an_error(self):
+        with mock.patch.object(running.inventory, "read_installed_apps", side_effect=OSError("denied")), \
+             self.assertLogs("upstream.running", "WARNING"):
+            self.assertEqual(running._installed_folders(), [])
+            self.assertEqual(running._other_roots(make_app(r"C:\Apps\One")), [])
+
+    def test_other_roots_leave_out_the_app_itself(self):
+        apps = [make_app(r"C:\Apps\One", reg_key="k1", name="One"), make_app(r"C:\Apps\Two", reg_key="k2", name="Two")]
+        with mock.patch.object(running.inventory, "read_installed_apps", return_value=apps):
+            self.assertEqual(running._other_roots(apps[0]), [guard.normalize(r"C:\Apps\Two")])
 
 
 class OwnProcessTest(unittest.TestCase):
@@ -293,9 +503,9 @@ class ProcessTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="upstream-running-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        guard_patch = exempt(self.tmp)
-        guard_patch.start()
-        self.addCleanup(guard_patch.stop)
+        for patch in (exempt(self.tmp), mock.patch.object(running, "_installed_folders", lambda: [])):
+            patch.start()
+            self.addCleanup(patch.stop)
         self.children: list[subprocess.Popen] = []
         self.addCleanup(self.reap)
         Path(self.tmp, "child.py").write_text(CHILD, "utf-8")
@@ -410,6 +620,16 @@ class ProcessTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assertEqual(asker.questions, [])
         self.assertIsNone(child.poll())
+
+    def test_a_cancelled_update_leaves_a_running_app_alone(self):
+        app, child = self.launch("close")
+        ctx, asker = make_ctx("auto")
+        ctx.cancel.cancel()
+        with self.assertRaises(Cancelled):
+            running.close_for_update(ctx, app, mock.Mock())
+        time.sleep(0.5)
+        self.assertIsNone(child.poll())
+        self.assertEqual(asker.questions, [])
 
     def test_only_the_apps_own_processes_are_closed(self):
         app, child = self.launch("close", "one")

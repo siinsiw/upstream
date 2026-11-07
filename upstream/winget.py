@@ -4,13 +4,17 @@ and verifies the file. Its manifests also list the GitHub links the scanner scor
 from __future__ import annotations
 
 import logging
+import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import unicodedata
 from dataclasses import dataclass
 from functools import lru_cache
 
+from .errors import Cancelled
 from .inventory import make_ident
 from .versioning import compare
 
@@ -23,6 +27,8 @@ _ARP_ID = re.compile(r"^ARP\\(Machine|User)\\(?:X64|X86|ARM64)\\(.+)$", re.I)
 _ARCH_TAG = re.compile(r"(?<![a-z0-9])(x64|x86|arm64|amd64|64-bit|32-bit)(?![a-z0-9])", re.I)
 _SIZE = re.compile(r"([\d.]+)\s*(KB|MB|GB)\s*/\s*([\d.]+)\s*(KB|MB|GB)", re.I)
 _PERCENT = re.compile(r"(\d{1,3})\s*%")
+# English lines winget prints once the download is over; other languages are caught by the output's shape (see update).
+_INSTALL_STARTS = re.compile(r"starting package install|verified installer hash", re.I)
 _UNITS = {"KB": 1, "MB": 1024, "GB": 1024 * 1024}
 
 
@@ -199,18 +205,77 @@ def show(pkg_id: str) -> dict:
     return meta
 
 
-def update(pkg_id: str, mode: str, on_progress, on_line) -> tuple[int, str]:
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """End a winget that has not started installing, and whatever it started: taskkill /T on its pid only."""
+    if proc.poll() is not None:
+        return
+    root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+    try:
+        subprocess.run([os.path.join(root, "System32", "taskkill.exe"), "/T", "/F", "/PID", str(proc.pid)],
+                       capture_output=True, timeout=15, creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        log.warning("taskkill could not end winget (pid %s)", proc.pid, exc_info=True)
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_install=None) -> tuple[int, str]:
     """Run `winget upgrade` (or `install` for a package winget did not match to
-    this machine) and stream its progress. Returns (exit code, last message)."""
+    this machine) and stream its progress. Returns (exit code, last message).
+
+    `cancel` (a context.CancelToken) ends the run. While winget only prepares and downloads it is terminated with
+    everything it started and Cancelled("Cancelled.") is raised. Once the install has begun it is left running
+    (stopping an installer half way can leave the app broken): Cancelled says that Upstream stopped waiting.
+    `on_progress(percent)` reports the download only; the moment the install begins `on_install()` is called
+    once and `on_progress` falls silent. The install is recognised by what winget prints, whatever the language:
+    a completed download, a percentage bar (the installer's own), any text after the download started, or
+    the English "Starting package install"."""
+    if cancel is not None:
+        cancel.check()
     args = ["winget", mode, "--id", pkg_id, "--exact", "--source", "winget", "--silent",
             "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             creationflags=CREATE_NO_WINDOW)
+    chunks: queue.Queue[bytes | None] = queue.Queue()
+    abandoned = threading.Event()
+
+    def pump():
+        """Reads on its own thread so the loop below can notice a cancel. It keeps reading after the loop gave
+        up, so a winget that is still installing never blocks on a full pipe."""
+        try:
+            while chunk := proc.stdout.read1(4096):
+                if not abandoned.is_set():
+                    chunks.put(chunk)
+        finally:
+            chunks.put(None)
+            proc.stdout.close()
+
+    threading.Thread(target=pump, daemon=True).start()
     last = ""
     buf = b""
+    downloading = installing = False
+
+    def begin_install():
+        nonlocal installing
+        if not installing:
+            installing = True
+            if on_install:
+                on_install()
+
     while True:
-        chunk = proc.stdout.read1(4096)
-        if not chunk:
+        if cancel is not None and cancel.is_set and proc.poll() is None:
+            if not installing:
+                _kill_tree(proc)
+                raise Cancelled("Cancelled.")
+            abandoned.set()
+            raise Cancelled("Stopped waiting for the installer. It may still be running.")
+        try:
+            chunk = chunks.get(timeout=0.1)
+        except queue.Empty:
+            continue
+        if chunk is None:
             break
         buf += chunk
         parts = re.split(rb"[\r\n]", buf)
@@ -224,11 +289,17 @@ def update(pkg_id: str, mode: str, on_progress, on_line) -> tuple[int, str]:
             if size:
                 done = float(size.group(1)) * _UNITS[size.group(2).upper()]
                 total = float(size.group(3)) * _UNITS[size.group(4).upper()]
-                on_progress(int(done * 100 / total) if total else -1)
+                if not installing:
+                    downloading = True
+                    on_progress(int(done * 100 / total) if total else -1)
+                    if total and done >= total:
+                        begin_install()
             elif pct and not re.search(r"[A-Za-z]{4,}", text):
-                on_progress(int(pct.group(1)))
+                begin_install()
             elif re.search(r"\w{3,}", text):
                 last = text
                 on_line(text)
+                if downloading or _INSTALL_STARTS.search(text):
+                    begin_install()
     code = proc.wait()
     return code & 0xFFFFFFFF, last

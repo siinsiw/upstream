@@ -322,6 +322,36 @@ class SettingsUiTest(unittest.TestCase):
             self.assertEqual(d.proxy_note.property("tone") or "", "")
             d.close()
 
+    def test_the_disabled_proxy_field_reads_as_muted_in_every_theme(self):
+        def distance(a, b):
+            return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+
+        def rgb(colour):
+            return (colour.red(), colour.green(), colour.blue())
+
+        for key, colours in theme.THEMES.items():
+            with self.subTest(theme=key):
+                theme.apply_theme(app, key)
+                d, _ = self.make(proxy={"mode": "system", "url": "http://proxy.corp:3128"})
+                d.show()
+                pump()
+                self.assertFalse(d.proxy_url.isEnabled())
+                image = d.proxy_url.grab().toImage()
+                ground = rgb(image.pixelColor(image.width() - 14, image.height() // 2))
+                muted = tuple(int(colours["muted"][i:i + 2], 16) for i in (1, 3, 5))
+                ink = max(distance(rgb(image.pixelColor(x, y)), ground)
+                          for x in range(8, image.width() // 2) for y in range(6, image.height() - 6))
+                self.assertGreater(ink, 0.5 * distance(muted, ground), "the text is drawn")
+                self.assertLessEqual(ink, distance(muted, ground) + 10, "and not at full contrast")
+                d.close()
+
+    def test_the_proxy_field_follows_a_theme_picked_while_the_dialog_is_open(self):
+        d, _ = self.make()
+        d.theme_changed.connect(lambda key: theme.apply_theme(app, key))
+        for key in ("midnight", "paper"):
+            d._on_theme(key)
+            self.assertIn(theme.THEMES[key]["muted"], d.proxy_url.styleSheet(), key)
+
     def test_it_fits_the_screen_with_a_parent_window(self):
         from PySide6.QtWidgets import QWidget
         parent = QWidget()

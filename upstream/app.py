@@ -36,8 +36,9 @@ def _clean_settings(settings: Settings):
     timeout = settings.get("install_timeout_min")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
         settings.set("install_timeout_min", 30)
-    if not isinstance(settings.get("signers"), dict):
-        settings.set("signers", {})
+    for key in ("signers", "signers_approved"):
+        if not isinstance(settings.get(key), dict):
+            settings.set(key, {})
 
 
 def main() -> int:

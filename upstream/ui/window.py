@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..context import CancelToken, Question, UpdateContext
+from ..errors import Cancelled
 from ..i18n import N_, english, num, render, tr, trn
 from ..scanner import AppStatus, Scanner
 from ..updater import Updater
@@ -33,7 +34,7 @@ TABS = {"updates": "Updates", "all": "All apps", "ignored": "Ignored"}
 # Progress messages (updater.py) shown while an installer runs; cancelling then only stops the waiting.
 INSTALL_PHASES = frozenset({"Installing", "Setup window opened"})
 # Seconds a cancelled update gets to stop by itself (a download does, in a moment) before the queue
-# moves on without it. Steps that ignore the token, such as winget, are left to finish in the background.
+# moves on without it. A step that does not notice the token is left to finish in the background.
 WIND_DOWN = 2.0
 
 
@@ -52,7 +53,8 @@ class Bus(QObject):
 class _Answer:
     """Carries the user's reply from the UI thread back to the worker that asked."""
 
-    def __init__(self):
+    def __init__(self, token: CancelToken):
+        self.token = token      # of the job that asked: once it is cancelled nobody is waiting for the reply
         self.event = threading.Event()
         self.value = False
 
@@ -316,7 +318,8 @@ class MainWindow(QMainWindow):
         self.scan_btn.setEnabled(True)
         self.last_scan = datetime.now()
         self.statuses = {s.uid: s for s in statuses if s.uid not in self.removed}
-        self.job_state.clear()  # scans never overlap installs, so these are all finished
+        # Finished jobs' results belong to the old list; a job that is still queued or running keeps its row control.
+        self.job_state = {uid: state for uid, state in self.job_state.items() if uid in self.active_jobs}
         self.populate()
         log.info("Check finished: %d apps, %d updates", len(statuses), sum(1 for s in statuses if s.update))
 
@@ -466,7 +469,8 @@ class MainWindow(QMainWindow):
     # -- updates -------------------------------------------------------
     def request_update(self, uid: str, bulk: bool = False):
         s = self.statuses.get(uid)
-        if not s or not s.update or uid in self.active_jobs or self._uninstall_running():
+        # A check replaces the list and the rows' job states; an update started meanwhile would lose its Cancel control.
+        if not s or not s.update or uid in self.active_jobs or self.scanning or self._uninstall_running():
             return
         upd = s.update
         if upd.source == "site" and not upd.download_url and not s.fallbacks:
@@ -509,27 +513,39 @@ class MainWindow(QMainWindow):
             self.cancel_job(uid)
 
     def _job_loop(self):
+        """The one worker: takes queued updates in order. Whatever goes wrong with one, it reports that update
+        as failed and carries on; a dead worker would leave every later job 'Queued' for good."""
         while True:
             uid, token = self.jobs.get()
-            with self.queue_lock:
-                if token.is_set:
-                    continue  # cancelled while queued; cancel_job already updated the row
-                self.taken.add(uid)
-            status = self.statuses.get(uid)
-            if status is None or status.update is None:
-                self.bus.job_finished.emit(uid, False, "No update pending anymore", {}, "")
-                continue
-            name = status.app.name
-            ctx = UpdateContext(self.settings, token, partial(self._ask_from_worker, token), uid in self.bulk_jobs)
-            log.info("Updating %s from %s (%s)", name, status.update.source, status.update.origin)
-            ok, template, values, version = self._run_update(uid, status, token, ctx)
-            log.info("%s: %s", name, english(template, values))
-            self.bus.job_finished.emit(uid, ok, template, values, version or "")
+            try:
+                outcome = self._run_job(uid, token)
+            except Exception as e:
+                log.exception("update job failed")
+                outcome = (False, "{error}", {"error": str(e)}, "")
+            if outcome:
+                self.bus.job_finished.emit(uid, *outcome)
+
+    def _run_job(self, uid: str, token: CancelToken) -> tuple | None:
+        """(ok, template, values, version) of one queued update; None when it was cancelled while queued
+        (cancel_job already updated the row)."""
+        with self.queue_lock:
+            if token.is_set:
+                return None
+            self.taken.add(uid)
+        status = self.statuses.get(uid)
+        if status is None or status.update is None:
+            return False, "No update pending anymore", {}, ""
+        name = status.app.name
+        ctx = UpdateContext(self.settings, token, partial(self._ask_from_worker, token), uid in self.bulk_jobs)
+        log.info("Updating %s from %s (%s)", name, status.update.source, status.update.origin)
+        ok, template, values, version = self._run_update(uid, status, token, ctx)
+        log.info("%s: %s", name, english(template, values))
+        return ok, template, values, version or ""
 
     def _run_update(self, uid: str, status: AppStatus, token: CancelToken, ctx: UpdateContext) -> tuple:
         """Run one update on its own thread. Once the user cancels, the update gets WIND_DOWN seconds to
-        notice; if it is still busy (winget cannot be interrupted) the queue moves on and it finishes in the
-        background, silently."""
+        notice; if it is still busy (an installer that is already running) the queue moves on and it
+        finishes in the background, silently."""
         result: list[tuple] = []
 
         def progress(template: str, pct: int, **values):
@@ -538,7 +554,10 @@ class MainWindow(QMainWindow):
 
         def work():
             try:
+                token.check()   # cancelled between being picked up and getting here: run nothing at all
                 result.append(self.updater.run(status, progress, ctx))
+            except Cancelled as e:
+                result.append((False, e.template, e.values, status.app.version))
             except Exception as e:
                 log.exception("update failed")
                 result.append((False, "{error}", {"error": str(e)}, ""))
@@ -585,7 +604,7 @@ class MainWindow(QMainWindow):
 
     def _ask_from_worker(self, token: CancelToken, question: Question) -> bool:
         """Runs on an update's worker thread: show the question in the window and wait for the reply."""
-        answer = _Answer()
+        answer = _Answer(token)
         self.bus.question.emit(question, answer)
         while not answer.event.wait(0.25):
             if token.is_set:
@@ -593,18 +612,22 @@ class MainWindow(QMainWindow):
         return answer.value
 
     def _on_question(self, question: Question, answer: _Answer):
-        box = QMessageBox(self)
-        box.setIcon(QMessageBox.Warning if question.danger else QMessageBox.Question)
-        box.setWindowTitle(tr("Upstream"))
-        box.setText(render(question.template, question.values))
-        if question.detail:
-            box.setInformativeText(render(question.detail, question.values))
-        yes = box.addButton(tr(question.yes), QMessageBox.AcceptRole)
-        no = box.addButton(tr(question.no), QMessageBox.RejectRole)
-        box.setDefaultButton(no if question.danger else yes)
-        box.exec()
-        answer.value = box.clickedButton() is yes
-        answer.event.set()
+        try:
+            if answer.token.is_set:
+                return      # cancelled while the question was on its way: the worker has stopped waiting
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning if question.danger else QMessageBox.Question)
+            box.setWindowTitle(tr("Upstream"))
+            box.setText(render(question.template, question.values))
+            if question.detail:
+                box.setInformativeText(render(question.detail, question.values))
+            yes = box.addButton(tr(question.yes), QMessageBox.AcceptRole)
+            no = box.addButton(tr(question.no), QMessageBox.RejectRole)
+            box.setDefaultButton(no if question.danger else yes)
+            box.exec()
+            answer.value = box.clickedButton() is yes
+        finally:
+            answer.event.set()  # whatever went wrong above, the worker must not be left polling for a dialog
 
     def _on_job_finished(self, uid: str, ok: bool, template: str, values: dict, version: str):
         self.active_jobs.discard(uid)
@@ -643,8 +666,8 @@ class MainWindow(QMainWindow):
         elif key == "ignore":
             now_ignored = not self.settings.is_ignored(ident)
             self.settings.set_ignored(ident, now_ignored)
-            if now_ignored:
-                self.populate()
+            if now_ignored or s.uid in self.active_jobs:
+                self.populate()     # a running update has nothing to recheck; the row only changes tab
             else:
                 self._recheck(s)
         elif key == "source":
@@ -685,7 +708,8 @@ class MainWindow(QMainWindow):
         self.populate()
 
     def _recheck(self, s: AppStatus):
-        if self.scanning:
+        # A recheck replaces the row's state: for an update that is queued or running that would drop its Cancel control.
+        if self.scanning or s.uid in self.active_jobs:
             return
         self._set_state(s.uid, ("progress", "Rechecking", {}, -1))
 

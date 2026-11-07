@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import unicodedata
 
 from PySide6.QtCore import QSize, Qt, Signal
@@ -17,6 +18,9 @@ from ..i18n import SOURCE_LABELS, isolate_lines, num, tr
 from ..scanner import AppStatus
 from .theme import repolish
 
+# Update, Cancel and Retry sit in the same spot of the row. For this long after one replaces another a click on
+# the newcomer is ignored: it is the second half of a double-click aimed at the old control.
+CLICK_GUARD = 0.4
 
 
 def ui_is_rtl() -> bool:
@@ -47,14 +51,20 @@ def ltr_label(text: str = "", name: str = "") -> QLabel:
 
 class ElidedLabel(QLabel):
     """One line, elided, laid out in the text's own direction (so 'Figma, Inc.' keeps
-    its full stop in an RTL window) and aligned to the UI's leading edge."""
+    its full stop in an RTL window) and aligned to the UI's leading edge, or to its trailing edge
+    (`trailing`) for a note that sits right before a control."""
 
-    def __init__(self, text: str = "", name: str = ""):
+    def __init__(self, text: str = "", name: str = "", trailing: bool = False):
         super().__init__()
         if name:
             self.setObjectName(name)
+        self.trailing = trailing
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.set_full_text(text)
+
+    @property
+    def full_text(self) -> str:
+        return self._full
 
     def set_full_text(self, text: str):
         self._full = text
@@ -72,8 +82,8 @@ class ElidedLabel(QLabel):
     def paintEvent(self, event):
         rtl_text = self.layoutDirection() == Qt.RightToLeft
         force = Qt.TextFlag.TextForceRightToLeft if rtl_text else Qt.TextFlag.TextForceLeftToRight
-        lead = Qt.AlignRight if ui_is_rtl() else Qt.AlignLeft
-        flags = lead.value | Qt.AlignAbsolute.value | Qt.AlignVCenter.value | force.value
+        side = Qt.AlignRight if ui_is_rtl() != self.trailing else Qt.AlignLeft
+        flags = side.value | Qt.AlignAbsolute.value | Qt.AlignVCenter.value | force.value
         p = QPainter(self)
         p.setFont(self.font())
         p.setPen(self.palette().color(self.foregroundRole()))
@@ -91,6 +101,7 @@ class AppRow(QFrame):
         self.setAttribute(Qt.WA_Hover)
         self.status = status
         self.uid = status.uid
+        self._page_since = float("-inf")    # when the action area last switched controls
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(14, 10, 10, 10)
@@ -130,9 +141,10 @@ class AppRow(QFrame):
         self.button.setObjectName("rowAction")
         self.button.setProperty("tone", "accent")
         self.button.setCursor(Qt.PointingHandCursor)
-        self.button.clicked.connect(lambda: self.update_clicked.emit(self.uid))
-        # Shown beside the button after the user cancelled: a neutral note, the update stays on offer.
-        self.note = QLabel()
+        self.button.clicked.connect(lambda: self._emit_unless_just_swapped(self.update_clicked))
+        # Shown beside the button after a cancel ("Cancelled": the update stays on offer) or a failure (a short
+        # reason, the whole text in the tooltip): a neutral note, one line, elided.
+        self.note = ElidedLabel(trailing=True)
         self.note.setProperty("tone", "muted")
         self.note.hide()
         holder = QWidget()
@@ -140,7 +152,7 @@ class AppRow(QFrame):
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(10)
         hl.addStretch(1)
-        hl.addWidget(self.note)
+        hl.addWidget(self.note, 100)
         hl.addWidget(self.button)
         self.actions.addWidget(holder)
 
@@ -171,7 +183,7 @@ class AppRow(QFrame):
         self.cancel_btn = QPushButton()
         self.cancel_btn.setObjectName("link")
         self.cancel_btn.setCursor(Qt.PointingHandCursor)
-        self.cancel_btn.clicked.connect(lambda: self.cancel_clicked.emit(self.uid))
+        self.cancel_btn.clicked.connect(lambda: self._emit_unless_just_swapped(self.cancel_clicked))
         # Room for the longer label, kept when it is hidden, so every bar in the list ends at the same place.
         self.cancel_btn.ensurePolished()   # the stylesheet sets the font size, so measure after it applies
         fm = self.cancel_btn.fontMetrics()
@@ -221,7 +233,7 @@ class AppRow(QFrame):
             self.new_ver.show()
             manual = upd.source == "site" and not upd.download_url and not status.fallbacks
             self.button.setText(tr("Open website") if manual else tr("Update"))
-            self.actions.setCurrentIndex(0)
+            self._show_page(0)
             tip = [tr("Source: {label} — {origin}", label=tr(SOURCE_LABELS[upd.source]), origin=upd.origin)]
             if upd.notes:
                 tip.append(isolate_lines(upd.notes[:600]))
@@ -246,7 +258,23 @@ class AppRow(QFrame):
         self.state.setText(text)
         self.state.setProperty("tone", tone)
         repolish(self.state)
-        self.actions.setCurrentIndex(2)
+        self._show_page(2)
+
+    def _show_page(self, index: int):
+        """Switch the action area. Another control now sits where the old one was: a click on it within
+        CLICK_GUARD is ignored, and the keyboard focus is not handed on to it (Space on Update would
+        otherwise land on Cancel, and the next Space press it)."""
+        if self.actions.currentIndex() == index:
+            return
+        focused = self.window().focusWidget()
+        if focused is not None and self.actions.isAncestorOf(focused):
+            focused.clearFocus()
+        self._page_since = time.monotonic()
+        self.actions.setCurrentIndex(index)
+
+    def _emit_unless_just_swapped(self, signal):
+        if time.monotonic() - self._page_since >= CLICK_GUARD:
+            signal.emit(self.uid)
 
     def set_icon(self, pixmap):
         self.icon.setPixmap(pixmap)
@@ -263,7 +291,7 @@ class AppRow(QFrame):
         self.pct.clear()
         self.bar.setRange(0, 0)
         self._cancel_control(tr("Cancel"))
-        self.actions.setCurrentIndex(1)
+        self._show_page(1)
 
     def set_progress(self, text: str, pct: int, cancel: str = ""):
         """`cancel` is "cancel" (the work stops), "wait" (the installer keeps running; only the waiting
@@ -281,7 +309,7 @@ class AppRow(QFrame):
                                  tr("Upstream stops waiting and moves on. The installer itself is not stopped."))
         else:
             self._cancel_control(tr("Cancel") if cancel else "")
-        self.actions.setCurrentIndex(1)
+        self._show_page(1)
 
     def set_cancelling(self):
         self.note.hide()
@@ -289,14 +317,15 @@ class AppRow(QFrame):
         self.pct.clear()
         self.bar.setRange(0, 0)
         self._cancel_control()
-        self.actions.setCurrentIndex(1)
+        self._show_page(1)
 
     def set_cancelled(self, message: str):
         """Not a failure: the user stopped it, so the row goes back to offering the update."""
-        self.note.setText(tr("Cancelled"))
+        self.note.set_full_text(tr("Cancelled"))
+        self.note.setToolTip(message)
         self.note.show()
         self.button.setText(tr("Update"))
-        self.actions.setCurrentIndex(0)
+        self._show_page(0)
         self.setToolTip(message)
         self.state.setToolTip(message)
 
@@ -308,8 +337,11 @@ class AppRow(QFrame):
             self.new_ver.hide()
             self._state(message, "accent")
         else:
+            self.note.set_full_text(" ".join(message.split()))
+            self.note.setToolTip(message)
+            self.note.show()
             self.button.setText(tr("Retry"))
-            self.actions.setCurrentIndex(0)
+            self._show_page(0)
             self.setToolTip(message)
         self.state.setToolTip(message)
 

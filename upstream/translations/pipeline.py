@@ -7,6 +7,6 @@ FA: dict[str, str] = {
     "No": "خیر",
     "Install anyway": "با این حال نصب کن",
     "Don't install": "نصب نکن",
-    "Not installed: you declined a file from a different publisher.":
-        "نصب نشد: فایلی از ناشر دیگر را رد کردی.",
+    "Not installed: you declined a file that wasn't signed by the app's usual publisher.":
+        "نصب نشد: فایلی را رد کردی که ناشر همیشگی برنامه آن را امضا نکرده بود.",
 }

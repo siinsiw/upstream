@@ -1,10 +1,13 @@
 """The network layer against a local server on 127.0.0.1: proxy choice, resumable downloads
-(Range, If-Range, 206/200/416, retries, cancel) and the metered / battery policy. No Internet."""
+(Range, If-Range, 206/200/416, retries, cancel), the https-only rules for unverified downloads
+and the metered / battery policy. No Internet."""
 from __future__ import annotations
 
 import base64
 import hashlib
+import http.client
 import http.server
+import io
 import json
 import logging
 import os
@@ -17,6 +20,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.response
 from pathlib import Path
 from unittest import mock
 
@@ -30,7 +34,8 @@ OTHER = random.Random(8).randbytes(700_000)
 
 
 class Origin(http.server.ThreadingHTTPServer):
-    """/file.bin and /named serve DATA with ETag, Last-Modified and Range support; /redirect goes to /named.
+    """/file.bin and /named serve DATA with ETag, Last-Modified and Range support; /redirect goes to /named
+    and /to-ftp to an ftp:// address (a redirect the opener must refuse).
     `faults` holds one entry per request: {"status": 503} or {"cut": n} (close the connection after n bytes)."""
     daemon_threads = True
 
@@ -57,10 +62,10 @@ class OriginHandler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlsplit(self.path).path
         with server.lock:
             server.requests.append((path, self.headers.get("Range"), self.headers.get("If-Range")))
-            fault = server.faults.pop(0) if server.faults and path != "/redirect" else {}
-        if path == "/redirect":
+            fault = server.faults.pop(0) if server.faults and path not in ("/redirect", "/to-ftp") else {}
+        if path in ("/redirect", "/to-ftp"):
             self.send_response(302)
-            self.send_header("Location", "/named?x=1")
+            self.send_header("Location", "/named?x=1" if path == "/redirect" else "ftp://127.0.0.1/file.bin")
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
@@ -359,11 +364,192 @@ class DownloadTest(unittest.TestCase):
         (self.dir / "out.bin").mkdir()          # a folder in the way: os.replace cannot overwrite it
         with self.assertRaises(InstallError) as caught:
             self.get()
-        self.assertEqual(caught.exception.template, "Could not save the download: {error}")
+        self.assertEqual(caught.exception.template, "Couldn't save the download: {error}")
 
     def test_downloads_stay_out_of_the_real_folder(self):
         self.assertEqual(net.DOWNLOAD_DIR, self.dir)
         self.assertNotEqual(net.DOWNLOAD_DIR, config.DOWNLOAD_DIR)
+
+    def test_a_redirect_to_another_protocol_is_refused_and_not_retried(self):
+        with self.assertRaises(InstallError) as caught:
+            self.get("/to-ftp")
+        self.assertEqual(caught.exception.template,
+                         "Refused: the server redirected the download to a less secure address.")
+        self.assertEqual(len(ORIGIN.requests), 1)
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+
+class FakeResponse(io.BytesIO):
+    """What net.urlopen hands back for a 200: the body, the final URL and the few attributes download reads."""
+
+    def __init__(self, body: bytes, url: str):
+        super().__init__(body)
+        self.url, self.status = url, 200
+        self.headers = {"Content-Length": str(len(body))}
+
+    def geturl(self):
+        return self.url
+
+
+class FakeHttps(urllib.request.BaseHandler):
+    """Answers https:// requests from {url: (status, Location header or body)} instead of the network."""
+    handler_order = 400         # ahead of the real HTTPSHandler
+
+    def __init__(self, pages):
+        self.pages = pages
+
+    def https_open(self, req):
+        status, payload = self.pages[req.full_url]
+        headers = http.client.HTTPMessage()
+        if status == 200:
+            body = payload
+        else:
+            body = b""
+            headers["Location"] = payload
+        resp = urllib.response.addinfourl(io.BytesIO(body), headers, req.full_url, status)
+        resp.msg = "OK" if status == 200 else "Found"
+        return resp
+
+
+class RedirectPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(net.log.setLevel, net.log.level)
+        net.log.setLevel(logging.ERROR)
+
+    def follow(self, source, target):
+        """What _SafeRedirect decides for a 302 from `source` to `target`: (new request, the response stream)."""
+        fp = io.BytesIO()
+        new = net._SafeRedirect().redirect_request(urllib.request.Request(source), fp, 302, "Found",
+                                                   http.client.HTTPMessage(), target)
+        return new, fp
+
+    def test_https_to_http_is_refused_even_to_the_same_host_or_loopback(self):
+        for target in ("http://example.test/a", "http://127.0.0.1:8000/a", "HTTP://example.test/a"):
+            fp = io.BytesIO()
+            with self.assertRaises(net.RedirectRefused, msg=target):
+                net._SafeRedirect().redirect_request(urllib.request.Request("https://example.test/x"), fp, 302,
+                                                     "Found", http.client.HTTPMessage(), target)
+            self.assertTrue(fp.closed)
+
+    def test_any_scheme_but_http_and_https_is_refused(self):
+        for source in ("http://example.test/x", "https://example.test/x"):
+            for target in ("ftp://example.test/a", "file:///C:/Windows/a.exe", "gopher://example.test/a"):
+                with self.assertRaises(net.RedirectRefused, msg=f"{source} -> {target}"):
+                    self.follow(source, target)
+
+    def test_hops_that_do_not_downgrade_are_followed(self):
+        for source, target in (("http://a.test/x", "http://b.test/y"), ("http://a.test/x", "https://b.test/y"),
+                               ("https://a.test/x", "https://b.test/y")):
+            new, _ = self.follow(source, target)
+            self.assertEqual(new.full_url, target)
+
+    def test_every_opener_is_built_with_it(self):
+        for mode in ("system", "none", "custom"):
+            opener = net._build_opener(mode, "127.0.0.1:3128")
+            redirectors = [h for h in opener.handlers if isinstance(h, urllib.request.HTTPRedirectHandler)]
+            self.assertEqual([type(h) for h in redirectors], [net._SafeRedirect], mode)
+
+    def test_the_opener_stops_at_the_refused_hop_and_follows_the_safe_one(self):
+        opener = net._build_opener("none", "")
+        opener.add_handler(FakeHttps({
+            "https://a.test/down": (302, "http://a.test/plain"),
+            "https://a.test/ftp": (302, "ftp://a.test/file"),
+            "https://a.test/ok": (302, "https://b.test/file"),
+            "https://b.test/file": (200, b"payload"),
+        }))
+        for page in ("down", "ftp"):
+            with self.assertRaises(net.RedirectRefused, msg=page):
+                opener.open(f"https://a.test/{page}")
+        with opener.open("https://a.test/ok") as resp:
+            self.assertEqual((resp.read(), resp.geturl()), (b"payload", "https://b.test/file"))
+
+    def test_loopback_hosts(self):
+        for host in ("localhost", "LOCALHOST", "127.0.0.1", "127.8.9.10", "::1"):
+            self.assertTrue(net._is_loopback(host), host)
+        for host in ("example.test", "10.0.0.1", "0.0.0.0", "localhost.example.test", "127.0.0.1.example.test",
+                     "", None):
+            self.assertFalse(net._is_loopback(host), host)
+
+
+class SecureDownloadTest(unittest.TestCase):
+    """Without a published SHA-256 only a download that stayed on https (or on this PC) is trusted."""
+    BODY = random.Random(9).randbytes(5000)
+    SHA = hashlib.sha256(BODY).hexdigest()
+    PLAIN = "Refused: this download isn't served over HTTPS and has no published checksum."
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.opened: list[str] = []
+        self.ends_at: str | None = None
+
+        def fake_urlopen(req, timeout=20):
+            self.opened.append(req.full_url)
+            return FakeResponse(self.BODY, self.ends_at or req.full_url)
+        for patch in (mock.patch.object(net, "DOWNLOAD_DIR", self.dir), mock.patch.object(net, "urlopen", fake_urlopen)):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(net.log.setLevel, net.log.level)
+        net.log.setLevel(logging.ERROR)
+
+    def get(self, url, sha=None):
+        return net.download(url, "app.exe", lambda done, total: None, sha)
+
+    def assertRefused(self, url, sha=None, template=PLAIN):
+        with self.assertRaises(InstallError) as caught:
+            self.get(url, sha)
+        self.assertEqual(caught.exception.template, template)
+        self.assertFalse((self.dir / "app.exe").exists())
+
+    def test_plain_http_without_a_hash_is_refused_before_any_request(self):
+        for url in ("http://downloads.example.test/app.exe", "ftp://downloads.example.test/app.exe"):
+            self.assertRefused(url)
+        self.assertEqual(self.opened, [])
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_plain_http_with_a_published_hash_is_allowed(self):
+        self.assertEqual(self.get("http://downloads.example.test/app.exe", self.SHA).read_bytes(), self.BODY)
+
+    def test_the_hash_must_still_match_on_plain_http(self):
+        with self.assertRaises(InstallError) as caught:
+            self.get("http://downloads.example.test/app.exe", "0" * 64)
+        self.assertTrue(caught.exception.template.startswith("The download's SHA-256 doesn't match"))
+        self.assertEqual(list(self.dir.iterdir()), [])
+
+    def test_https_needs_no_hash(self):
+        self.assertEqual(self.get("https://downloads.example.test/app.exe").read_bytes(), self.BODY)
+
+    def test_an_https_request_that_ends_on_plain_http_is_refused_without_a_hash(self):
+        self.ends_at = "http://mirror.example.test/app.exe"
+        self.assertRefused("https://downloads.example.test/app.exe")
+        self.assertEqual(len(self.opened), 1)
+        self.assertEqual(self.get("https://downloads.example.test/app.exe", self.SHA).read_bytes(), self.BODY)
+
+    def test_loopback_urls_are_exempt(self):
+        for url in ("http://127.0.0.1:8080/app.exe", "http://localhost/app.exe", "http://[::1]:8080/app.exe"):
+            self.assertEqual(self.get(url).read_bytes(), self.BODY, url)
+
+    def test_a_loopback_request_that_ends_elsewhere_on_plain_http_is_refused(self):
+        self.ends_at = "http://203.0.113.9/app.exe"
+        self.assertRefused("http://127.0.0.1:8080/app.exe")
+
+    def test_a_416_that_finishes_the_kept_file_checks_the_address_too(self):
+        url = "https://downloads.example.test/app.exe"
+        part, meta_path = net._part_paths(url)
+        part.write_bytes(self.BODY)
+        meta_path.write_text(json.dumps({"url": url, "name": "app.exe", "etag": '"v1"', "last_modified": "",
+                                         "size": len(self.BODY)}), "utf-8")
+        headers = http.client.HTTPMessage()
+        headers["Content-Range"] = f"bytes */{len(self.BODY)}"
+
+        def answer(req, timeout=20):
+            raise urllib.error.HTTPError("http://mirror.example.test/app.exe", 416, "Range Not Satisfiable",
+                                         headers, io.BytesIO())
+        with mock.patch.object(net, "urlopen", answer):
+            self.assertRefused(url)
+            self.assertTrue(part.exists())      # kept, nothing was moved into place
+            self.assertEqual(self.get(url, self.SHA).read_bytes(), self.BODY)
 
 
 class ProxyTest(unittest.TestCase):

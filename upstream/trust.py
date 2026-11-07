@@ -4,7 +4,11 @@ The usual publisher is, in order of trust:
   1. the certificate CN remembered after a verified install (settings["signers"]),
   2. the Authenticode signer of the installed app's own files,
   3. the registry "Publisher" text. Anyone can write that, so it can make Upstream ask but never block.
-A file without a signature is fine for an app that was never signed (most open-source apps).
+Certificate names (1 and 2) must match exactly once case, punctuation, word order and legal forms are ignored;
+the registry text only has to be contained in the signer's name. A signer the user accepted after a warning
+(settings["signers_approved"]) counts as the usual one for that app, without replacing the remembered CN.
+A file without a signature is fine only for an app with no signed baseline (most open-source apps); with no
+baseline, a signature Windows rejects (untrusted, broken, unsupported) is still questioned.
 Owner: the publisher-signature feature."""
 from __future__ import annotations
 
@@ -16,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import installer
-from .i18n import english
+from .i18n import N_, english
 from .inventory import InstalledApp
 
 log = logging.getLogger("upstream.trust")
@@ -51,10 +55,21 @@ def _tokens(name: str) -> frozenset[str]:
     return frozenset(re.findall(r"\w+", text)) - _LEGAL
 
 
-def _same_publisher(a: str, b: str) -> bool:
-    """Case, punctuation, word order and legal forms are ignored; one name may be a longer form of the other."""
-    x, y = _tokens(a), _tokens(b)
-    return bool(x and y) and (x <= y or y <= x)
+def _same_publisher(usual: str, signer: str, strong: bool = True) -> bool:
+    """Case, punctuation, word order and legal forms are ignored. Certificate names must then be equal, so
+    'Microsoft Corporation Fake Ltd' is not 'Microsoft Corporation'. Registry text (strong=False) is only a hint
+    and may be shorter than the certificate name: every word of it must appear in the signer's name."""
+    x, y = _tokens(usual), _tokens(signer)
+    if not (x and y):
+        return False
+    return x == y if strong else x <= y
+
+
+def _approved(settings, ident: str) -> list[str]:
+    """Signers the user accepted for this app after a warning (the key may be missing or damaged in old files)."""
+    data = settings.get("signers_approved", {}) if settings is not None else {}
+    names = data.get(ident) if isinstance(data, dict) else None
+    return [n.strip() for n in names if isinstance(n, str) and _tokens(n)] if isinstance(names, list) else []
 
 
 def _policy(settings) -> str:
@@ -147,30 +162,50 @@ def _expected(settings, app: InstalledApp) -> _Usual | None:
     return None
 
 
-def _judge(policy: str, usual: _Usual | None, app: InstalledApp, status: str, signer: str) -> Decision:
-    signed = status == "Valid" and bool(signer)
-    if usual is None:
-        log.info("%s: nothing known about its publisher (%s %s), allowing", app.name, status, signer)
-        return Decision("allow")
-    if signed and _same_publisher(usual.name, signer):
-        log.info("%s: signed by %s, the usual publisher (%s)", app.name, signer, usual.name)
-        return Decision("allow")
-    if not signed and not usual.strong:
-        # The registry text does not say whether the app was ever signed.
-        log.info("%s: file not signed (%s) and no signed copy is installed, allowing", app.name, status)
-        return Decision("allow")
+# Second paragraph shared by the "Windows couldn't verify the signature" questions.
+_UNVERIFIED_DETAIL = N_(
+    "The certificate may be untrusted, revoked or expired, or the file may have been altered. If you didn't "
+    "expect this, choose “Don't install” and get the update from the app's official website.")
 
-    block = policy == "block" and usual.strong
-    values = {"name": app.name, "usual": usual.name}
+
+def _judge(policy: str, usual: _Usual | None, app: InstalledApp, status: str, signer: str,
+           approved: tuple[str, ...] = ()) -> Decision:
+    signed = status == "Valid" and bool(signer)
+    strong = usual is not None and usual.strong
     if signed:
-        values["signer"] = signer
-        if block:
+        if usual is None:
+            log.info("%s: nothing known about its publisher (%s %s), allowing", app.name, status, signer)
+            return Decision("allow")
+        if _same_publisher(usual.name, signer, usual.strong):
+            log.info("%s: signed by %s, the usual publisher (%s)", app.name, signer, usual.name)
+            return Decision("allow")
+        if any(_same_publisher(name, signer) for name in approved):
+            log.info("%s: signed by %s, which you accepted earlier", app.name, signer)
+            return Decision("allow")
+        values = {"name": app.name, "usual": usual.name, "signer": signer}
+        if policy == "block" and strong:
             return Decision("block", "Blocked: {name} is normally published by {usual}, but this file is signed by "
                                      "{signer}. Nothing was installed. You can change this in Settings.", values)
         return Decision(
             "ask", "{name} is normally published by {usual}, but this file is signed by {signer}.", values,
             "This can happen when a company is renamed or sold, but it can also mean the download was swapped. "
-            "If you didn't expect it, choose Don't install and get the update from the app's official website.")
+            "If you didn't expect it, choose “Don't install” and get the update from the app's official website.")
+
+    if not strong:
+        # Without a certificate name to compare with, only "no signature" and "could not ask" are normal: most
+        # open-source apps are unsigned, and the registry text does not say whether the app was ever signed.
+        if status == "Valid":
+            log.info("%s: valid signature without a readable name and no signed baseline, allowing", app.name)
+            return Decision("allow")
+        if status == "NotSigned":
+            log.info("%s: file not signed and no signed copy is installed, allowing", app.name)
+            return Decision("allow")
+        if status == "Unknown":
+            log.warning("%s: the signature check itself failed and no signed copy is installed, allowing", app.name)
+            return Decision("allow")
+
+    block = policy == "block"
+    values = {"name": app.name} if usual is None else {"name": app.name, "usual": usual.name}
     if status == "NotSigned":
         if block:
             return Decision("block", "Blocked: {name} is normally signed by {usual}, but this file isn't digitally "
@@ -178,14 +213,19 @@ def _judge(policy: str, usual: _Usual | None, app: InstalledApp, status: str, si
         return Decision(
             "ask", "{name} is normally signed by {usual}, but this file isn't digitally signed.", values,
             "Without a signature there is no way to tell who made the file. If you didn't expect this, choose "
-            "Don't install and get the update from the app's official website.")
+            "“Don't install” and get the update from the app's official website.")
+    if usual is None:
+        if block:
+            return Decision("block", "Blocked: Windows couldn't verify the digital signature of this file for "
+                                     "{name}. Nothing was installed. You can change this in Settings.", values)
+        return Decision("ask", "Windows couldn't verify the digital signature of this file for {name}.", values,
+                        _UNVERIFIED_DETAIL)
     if block:
         return Decision("block", "Blocked: {name} is normally signed by {usual}, but Windows couldn't verify this "
                                  "file's signature. Nothing was installed. You can change this in Settings.", values)
     return Decision(
         "ask", "{name} is normally signed by {usual}, but Windows couldn't verify this file's signature.", values,
-        "The certificate may be untrusted, revoked or expired, or the file may have been altered. If you didn't "
-        "expect this, choose Don't install and get the update from the app's official website.")
+        _UNVERIFIED_DETAIL)
 
 
 def evaluate(settings, app: InstalledApp, sig_status: str, signer: str) -> Decision:
@@ -196,26 +236,41 @@ def evaluate(settings, app: InstalledApp, sig_status: str, signer: str) -> Decis
     policy = _policy(settings)
     if policy == "off":
         return Decision("allow")
-    decision = _judge(policy, _expected(settings, app), app, status, signer)
+    decision = _judge(policy, _expected(settings, app), app, status, signer, tuple(_approved(settings, app.ident)))
     if decision.action != "allow":
         log.warning("%s: %s - %s", app.name, decision.action, english(decision.template, decision.values))
     return decision
 
 
-def remember(settings, app: InstalledApp, signer: str, sig_status: str | None = None) -> None:
-    """Called after a successful install: this signer is now the app's known publisher. Only a signature
-    Windows reported as Valid counts; without sig_status, the status evaluate() saw for this file is used.
-    Nothing is learned while the check is off, since then no file is being checked."""
+def remember(settings, app: InstalledApp, signer: str, sig_status: str | None = None, approved: bool = False) -> None:
+    """Called after a successful install. Only a signature Windows reported as Valid counts; without sig_status,
+    the status evaluate() saw for this file is used. Nothing is learned while the check is off, since then no
+    file is being checked.
+    approved=False: this signer is now the app's remembered publisher (a signer the user accepted earlier is
+    never promoted to that, so it cannot push the real publisher out).
+    approved=True: the user said yes to a warning. The signer is only added to settings["signers_approved"],
+    so the remembered publisher stays what it was and the next update from the real one is not questioned."""
     signer = (signer or "").strip()
     seen = _seen.pop((app.ident, signer), None)
-    if settings is None or not signer or (sig_status or seen) != "Valid" or _policy(settings) == "off":
+    if settings is None or not _tokens(signer) or (sig_status or seen) != "Valid" or _policy(settings) == "off":
         return
     with _lock:
-        signers = dict(_signers(settings))
-        if signers.get(app.ident) == signer:
-            return
-        signers[app.ident] = signer
-        settings.set("signers", signers)
+        known = _approved(settings, app.ident)
+        trusted = any(_same_publisher(name, signer) for name in known)
+        if approved:
+            if trusted:
+                return
+            everyone = settings.get("signers_approved", {})
+            everyone = dict(everyone) if isinstance(everyone, dict) else {}
+            everyone[app.ident] = [*known, signer]
+            key, value = "signers_approved", everyone
+        else:
+            signers = dict(_signers(settings))
+            if trusted or signers.get(app.ident) == signer:
+                return
+            signers[app.ident] = signer
+            key, value = "signers", signers
+        settings.set(key, value)
         try:
             settings.save()
         except OSError:

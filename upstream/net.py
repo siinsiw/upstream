@@ -7,6 +7,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import http.client
+import ipaddress
 import json
 import logging
 import os
@@ -46,6 +47,53 @@ def configure(settings) -> None:
         _opener_cache = None
 
 
+# --- redirects and plain http ----------------------------------------------------------------
+
+class RedirectRefused(urllib.error.URLError):
+    """A redirect the openers built here will not follow (see _SafeRedirect)."""
+
+
+def _origin(url: str) -> str:
+    parts = urllib.parse.urlsplit(url)
+    return f"{parts.scheme}://{parts.hostname or ''}"
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses a redirect from https to http, and any redirect to something other than http or
+    https (urllib would follow ftp), so a secure download cannot be pushed onto an open channel."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = (urllib.parse.urlsplit(u).scheme.lower() for u in (req.full_url, newurl))
+        if new not in ("http", "https") or (old == "https" and new == "http"):
+            fp.close()
+            log.warning("Refused a redirect from %s to %s", _origin(req.full_url), _origin(newurl))
+            raise RedirectRefused(f"refused a redirect from {old} to {new or 'an unknown scheme'}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _is_loopback(host: str | None) -> bool:
+    if not host:
+        return False
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _require_secure(url: str, expected_sha256: str | None) -> None:
+    """Anything not on https can be swapped by whoever sits on the path, so it is only acceptable
+    when a published SHA-256 vouches for the file. Loopback never leaves the PC and is exempt."""
+    if expected_sha256:
+        return
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() == "https" or _is_loopback(parts.hostname):
+        return
+    log.warning("Refused to download from %s: not https and no published checksum", _origin(url))
+    raise InstallError("Refused: this download isn't served over HTTPS and has no published checksum.")
+
+
 # --- proxy -----------------------------------------------------------------------------------
 
 _opener_lock = threading.Lock()
@@ -77,12 +125,14 @@ def _proxy_address(url: str) -> str:
 
 
 def _build_opener(mode: str, url: str) -> urllib.request.OpenerDirector:
+    redirects = _SafeRedirect()     # replaces urllib's own redirect handler in every opener
     if mode == "none":
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}), redirects)
     if mode == "custom":
         proxy = _proxy_address(url)
-        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-    return urllib.request.build_opener()    # system: environment variables, then the Windows registry
+        return urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                                           redirects)
+    return urllib.request.build_opener(redirects)    # system: environment variables, then the Windows registry
 
 
 def _opener() -> urllib.request.OpenerDirector:
@@ -371,7 +421,7 @@ def _purge_stale() -> None:
 
 
 def _save_error(e: OSError) -> InstallError:
-    return InstallError("Could not save the download: {error}", error=str(e))
+    return InstallError("Couldn't save the download: {error}", error=str(e))
 
 
 def _hash_prefix(digest, path: Path, size: int, cancel) -> None:
@@ -423,7 +473,9 @@ def _attempt(url: str, file_name: str | None, part: Path, meta_path: Path, on_pr
     except urllib.error.HTTPError as e:
         if e.code == 416 and offset:
             size = _range_total(e.headers.get("Content-Range"))
+            final_url = e.geturl()
             e.close()
+            _require_secure(final_url, expected_sha256)
             if size != offset:
                 raise _Restart() from None
             digest = hashlib.sha256() if expected_sha256 else None
@@ -433,6 +485,7 @@ def _attempt(url: str, file_name: str | None, part: Path, meta_path: Path, on_pr
                              expected_sha256, True)      # the kept file already is the whole file
         raise
     with resp:
+        _require_secure(resp.geturl(), expected_sha256)      # the address after any redirects
         if resp.status == 206 and offset:
             size = _range_total(resp.headers.get("Content-Range"))
             etag = resp.headers.get("ETag") or ""
@@ -509,7 +562,11 @@ def download(url: str, file_name: str | None, on_progress, expected_sha256: str 
 
     The partial file stays on disk, with a sidecar holding the URL, validators and expected size,
     after a cancel or a failure; the next call for the same URL continues from it (Range plus
-    If-Range). Transient failures are retried up to three times with a growing pause."""
+    If-Range). Transient failures are retried up to three times with a growing pause.
+
+    A URL that is not https (before or after redirects) is refused unless `expected_sha256` is
+    given; redirects from https to http are never followed."""
+    _require_secure(url, expected_sha256)
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _purge_stale()
     part, meta_path = _part_paths(url)
@@ -523,6 +580,8 @@ def download(url: str, file_name: str | None, on_progress, expected_sha256: str 
         except _Restart:
             log.info("Discarding the partial download of %s and starting over", url)
             _discard(part, meta_path)
+        except RedirectRefused:
+            raise InstallError("Refused: the server redirected the download to a less secure address.") from None
         except (OSError, http.client.HTTPException) as e:
             if isinstance(e, urllib.error.HTTPError):
                 e.close()

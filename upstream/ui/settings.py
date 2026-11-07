@@ -21,16 +21,16 @@ log = logging.getLogger("upstream.ui.settings")
 # (settings key, title, one-line explanation, [(stored value, label)]): the first value is the default
 POLICIES = (
     ("publisher_policy", N_("Publisher check"),
-     N_("When an update is signed by someone other than the app's usual publisher."),
+     N_("When an update isn't verifiably signed by the app's usual publisher."),
      (("ask", N_("Ask me")), ("block", N_("Block the update")), ("off", N_("Don't check")))),
     ("close_apps_policy", N_("Running apps"),
      N_("When an app is open while it is being updated."),
-     (("ask", N_("Ask me")), ("auto", N_("Close it automatically")), ("never", N_("Skip the update")))),
+     (("ask", N_("Ask me")), ("auto", N_("Close it automatically")), ("never", N_("Leave it to the installer")))),
     ("metered_policy", N_("Metered connection"),
      N_("When Windows marks your connection as metered (limited data)."),
      (("ask", N_("Ask me")), ("skip", N_("Skip the update")), ("ignore", N_("Update anyway")))),
     ("battery_policy", N_("Battery"),
-     N_("When your PC is running low on battery."),
+     N_("When your PC is unplugged and the battery is low or battery saver is on."),
      (("ask", N_("Ask me")), ("skip", N_("Skip the update")), ("ignore", N_("Update anyway")))),
 )
 PROXY_MODES = (("system", N_("Use Windows settings")), ("none", N_("No proxy")), ("custom", N_("Custom address")))
@@ -283,7 +283,7 @@ class SettingsDialog(QDialog):
         self.proxy_url = QLineEdit(str(proxy.get("url") or ""))
         self.proxy_url.setPlaceholderText(PROXY_EXAMPLE)
         self.proxy_url.setLayoutDirection(Qt.LeftToRight)
-        self.proxy_url.setStyleSheet("QLineEdit:disabled { background: transparent; }")   # reads as off in every theme
+        self._style_proxy_field()
         self.proxy_label.setBuddy(self.proxy_url)
         url_row = QHBoxLayout()
         url_row.setSpacing(12)
@@ -394,8 +394,13 @@ class SettingsDialog(QDialog):
 
     def _on_theme(self, key: str):
         self.theme_changed.emit(key)
+        self._style_proxy_field()
         for card in self.cards:
             card.update()
+
+    def _style_proxy_field(self):
+        """The field reads as off in every theme: no fill, muted text (the theme's own rule keeps full contrast)."""
+        self.proxy_url.setStyleSheet(f"QLineEdit:disabled {{ background: transparent; color: {current()['muted']}; }}")
 
     def _set_source(self, key: str, value: bool):
         self._store(key, value)

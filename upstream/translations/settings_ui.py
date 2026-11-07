@@ -4,20 +4,22 @@ FA: dict[str, str] = {
     "These apply from the next update.": "این تنظیم‌ها از به‌روزرسانی بعدی اعمال می‌شوند.",
     "Ask me": "از من بپرس",
     "Publisher check": "بررسی ناشر",
-    "When an update is signed by someone other than the app's usual publisher.":
-        "وقتی امضای به‌روزرسانی با ناشر همیشگی برنامه فرق دارد.",
+    "When an update isn't verifiably signed by the app's usual publisher.":
+        "وقتی تأیید نشود که ناشر همیشگی برنامه به‌روزرسانی را امضا کرده است.",
     "Block the update": "به‌روزرسانی مسدود شود",
     "Don't check": "بررسی نشود",
     "Running apps": "برنامه‌های در حال اجرا",
     "When an app is open while it is being updated.": "وقتی برنامه هنگام به‌روزرسانی باز است.",
     "Close it automatically": "خودکار بسته شود",
     "Skip the update": "به‌روزرسانی انجام نشود",
+    "Leave it to the installer": "به نصب‌کننده واگذار شود",
     "Metered connection": "اتصال حجمی",
     "When Windows marks your connection as metered (limited data).":
         "وقتی ویندوز اتصال را حجمی (با سقف مصرف) علامت زده است.",
     "Update anyway": "با این حال به‌روزرسانی شود",
     "Battery": "باتری",
-    "When your PC is running low on battery.": "وقتی شارژ باتری رایانه کم است.",
+    "When your PC is unplugged and the battery is low or battery saver is on.":
+        "وقتی رایانه به برق وصل نیست و شارژ باتری کم است یا حالت صرفه‌جویی باتری روشن است.",
     "Network proxy": "پروکسی شبکه",
     "Used for update checks and downloads.": "برای بررسی به‌روزرسانی‌ها و دانلودها استفاده می‌شود.",
     "Use Windows settings": "طبق تنظیمات ویندوز",

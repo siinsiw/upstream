@@ -5,7 +5,7 @@ FA: dict[str, str] = {
     "The installer needs administrator permission": "نصب‌کننده به اجازهٔ مدیر سیستم نیاز دارد",
     "There isn't enough free disk space to install": "فضای خالی دیسک برای نصب کافی نیست",
     "The installer was denied access. It may need administrator permission (code {code})":
-        "ویندوز دسترسی نصب‌کننده را رد کرد؛ شاید به اجازهٔ مدیر سیستم نیاز دارد (کد {code})",
+        "به نصب‌کننده دسترسی داده نشد؛ شاید به اجازهٔ مدیر سیستم نیاز دارد (کد {code})",
     "Another version of this app is already installed, so this installer can't continue":
         "نسخهٔ دیگری از این برنامه از قبل نصب است، برای همین این نصب‌کننده ادامه نمی‌دهد",
     "Another installation is running, waiting…": "نصب دیگری در جریان است، در انتظار…",
@@ -13,7 +13,7 @@ FA: dict[str, str] = {
     "The Windows Installer service couldn't be reached (code {code})":
         "سرویس Windows Installer در دسترس نبود (کد {code})",
     "Windows Installer hit a fatal error during installation (code {code})":
-        "برنامهٔ Windows Installer هنگام نصب به خطای جدی خورد (کد {code})",
+        "برنامهٔ Windows Installer هنگام نصب دچار خطای جدی شد (کد {code})",
     "The installation was suspended before it finished (code {code})":
         "نصب پیش از تمام شدن متوقف شد (کد {code})",
     "The installer package couldn't be opened (code {code})": "بستهٔ نصب باز نشد (کد {code})",
@@ -35,23 +35,23 @@ FA: dict[str, str] = {
     "Windows doesn't allow installing from a remote session (code {code})":
         "ویندوز نصب از داخل نشست راه دور را مجاز نمی‌داند (کد {code})",
     # Inno Setup and NSIS
-    "Setup couldn't start (code {code})": "نصب‌کننده نتوانست شروع شود (کد {code})",
+    "Setup couldn't start (code {code})": "اجرای نصب‌کننده ممکن نشد (کد {code})",
     "Setup hit a fatal error while preparing to install (code {code})":
-        "نصب‌کننده هنگام آماده‌سازی نصب به خطای جدی خورد (کد {code})",
+        "نصب‌کننده هنگام آماده‌سازی نصب دچار خطای جدی شد (کد {code})",
     "Setup hit a fatal error while installing (code {code})":
-        "نصب‌کننده هنگام نصب به خطای جدی خورد (کد {code})",
+        "نصب‌کننده هنگام نصب دچار خطای جدی شد (کد {code})",
     "Setup decided it can't install on this PC (code {code})":
         "نصب‌کننده تشخیص داد که نمی‌تواند روی این رایانه نصب کند (کد {code})",
     "Setup can't continue until Windows is restarted":
         "تا ویندوز دوباره راه‌اندازی نشود، نصب ادامه پیدا نمی‌کند",
     "The installer stopped itself before it finished (code {code})":
-        "نصب‌کننده پیش از تمام شدن خودش متوقف شد (کد {code})",
+        "نصب‌کننده پیش از پایان کار، خودش را متوقف کرد (کد {code})",
     # winget
     "winget couldn't download the installer": "ابزار winget نتوانست نصب‌کننده را دانلود کند",
     "winget has no installer that fits this PC": "ابزار winget نصب‌کننده‌ای مناسب این رایانه ندارد",
     "winget couldn't find this package": "ابزار winget این بسته را پیدا نکرد",
     "winget has no update it can apply to this app":
-        "ابزار winget به‌روزرسانی قابل‌اعمالی برای این برنامه پیدا نکرد",
+        "ابزار winget برای این برنامه به‌روزرسانی قابل نصبی ندارد",
     "winget says another version of this app is already installed":
         "طبق گفتهٔ winget نسخهٔ دیگری از این برنامه از قبل نصب است",
     "winget says a newer version of this app is already installed":
