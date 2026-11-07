@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import logging.handlers
 import os
 import shutil
 import threading
@@ -17,6 +18,8 @@ CONFIG_DIR = _ROAMING / APP_NAME
 DATA_DIR = _LOCAL / APP_NAME
 DOWNLOAD_DIR = DATA_DIR / "downloads"
 LOG_FILE = DATA_DIR / "upstream.log"
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUPS = 2     # upstream.log plus .1 and .2: three files of about 1 MB
 
 
 def migrate_legacy():
@@ -164,12 +167,28 @@ class Cache(JsonStore):
             self.data[section][key] = value
 
 
+class RotatingLogHandler(logging.handlers.RotatingFileHandler):
+    """Another Upstream process (a hand-over, an elevated relaunch) can have the log open while it is rotated;
+    Windows then refuses the rename. Keep writing to the current file and rotate on a later record."""
+
+    def doRollover(self):
+        try:
+            super().doRollover()
+        except OSError:
+            if self.stream is None:
+                self.stream = self._open()
+
+
+def log_handler(path: Path | None = None) -> logging.Handler:
+    handler = RotatingLogHandler(path or LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    return handler
+
+
 def setup_logging() -> logging.Logger:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger("upstream")
     root.setLevel(logging.INFO)
     if not root.handlers:
-        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-        root.addHandler(fh)
+        root.addHandler(log_handler())
     return root

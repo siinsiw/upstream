@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from .context import CancelToken
 from .exitcodes import Outcome
 from .inventory import InstalledApp, read_installed_apps
-from .versioning import compare, parse_version
+from .versioning import compare, parse_version, same_version
 
 log = logging.getLogger("upstream.verify")
 
@@ -127,18 +127,29 @@ def _inspect(app: InstalledApp, before: Snapshot) -> tuple[str, InstalledApp | N
     return "unknown", None, None
 
 
+def _inspect_for(app: InstalledApp, before: Snapshot, downgrade_to: str):
+    """`_inspect`, except that for a rollback the registry showing exactly the version asked for counts as installed
+    (the version went down, so nothing is newer than before)."""
+    kind, entry, old = _inspect(app, before)
+    if (downgrade_to and kind == "unchanged" and entry is not None and same_version(entry.version, downgrade_to)
+            and not same_version(app.version, downgrade_to)):
+        return "installed", entry, old
+    return kind, entry, old
+
+
 def _restart_flag_is_new(before: Snapshot) -> bool:
     return any(count > before.pending.get(name, 0) for name, count in _pending_flags().items())
 
 
 def check(app: InstalledApp, before: Snapshot, outcome: Outcome, expected_version: str,
-          cancel: CancelToken | None = None) -> Verdict:
-    """Cancelling ends the settle wait at once; the verdict then rests on what the registry shows now."""
+          cancel: CancelToken | None = None, downgrade_to: str = "") -> Verdict:
+    """Cancelling ends the settle wait at once; the verdict then rests on what the registry shows now.
+    `downgrade_to` is the version a rollback was asked to install."""
     expected = expected_version or app.version
     kind, entry = "unknown", None
     if not app.reg_key.startswith(STORE_PREFIX):
         try:
-            kind, entry, _ = _inspect(app, before)
+            kind, entry, _ = _inspect_for(app, before, downgrade_to)
             # Not for an installer that only said the app is already there: it started no hand-over to wait for.
             settle = not outcome.restart and not outcome.present
             deadline = time.monotonic() + SETTLE_SECONDS
@@ -147,7 +158,7 @@ def check(app: InstalledApp, before: Snapshot, outcome: Outcome, expected_versio
                     time.sleep(1)
                 elif cancel.wait(1):
                     break
-                kind, entry, _ = _inspect(app, before)
+                kind, entry, _ = _inspect_for(app, before, downgrade_to)
         except Exception:
             log.exception("%s: could not read the installed apps", app.name)
     version = entry.version if entry and kind in ("installed", "side_by_side") else expected

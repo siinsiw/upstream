@@ -116,7 +116,8 @@ class Updater:
                 # The user stopped it (closed the installer, declined UAC): do not start another source.
                 return False, outcome.template or "Cancelled.", outcome.values, app.version
             if outcome.ok or outcome.present:
-                verdict = verify.check(app, done.before, outcome, upd.version, cancel=ctx.cancel)
+                extra = {"downgrade_to": upd.version} if upd.winget_mode == "rollback" else {}
+                verdict = verify.check(app, done.before, outcome, upd.version, cancel=ctx.cancel, **extra)
                 log.info("%s: %s (%s)", app.name, verdict.kind, english(verdict.template, verdict.values))
                 if outcome.ok or verdict.kind in _APPLIED:
                     if outcome.ok and done.signer and verdict.kind in ("installed", "restart"):
@@ -220,6 +221,7 @@ class Updater:
                 lambda line: log.info("winget %s: %s", upd.origin, line),
                 cancel=ctx.cancel,
                 on_install=lambda: progress("Installing", -1),
+                version=upd.version if upd.winget_mode == "rollback" else None,
             )
             return exitcodes.classify_winget(code, last)
 

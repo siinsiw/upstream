@@ -289,5 +289,34 @@ class TranslationTest(unittest.TestCase):
             self.assertEqual(fields(v.template), set(v.values), v.template)
 
 
+class RollbackTest(unittest.TestCase):
+    """A rollback lowers the version: the registry showing exactly the asked-for version is a success."""
+
+    @staticmethod
+    def app(version):
+        return InstalledApp(reg_key=r"HKLM64\X", name="Demo", version=version, publisher="p", scope="machine", arch="x64")
+
+    def verdict(self, now, *, downgrade_to=""):
+        before = Snapshot(entries=[self.app("2.0")])
+        with mock.patch.object(verify, "_family", lambda a: [self.app(now)]),              mock.patch.object(verify, "_restart_flag_is_new", lambda b: False),              mock.patch.object(verify, "SETTLE_SECONDS", 0):
+            return verify.check(self.app("2.0"), before, Outcome("ok"), "1.5", downgrade_to=downgrade_to)
+
+    def test_the_requested_older_version_is_installed(self):
+        v = self.verdict("1.5", downgrade_to="1.5")
+        self.assertEqual((v.kind, v.version, v.ok), ("installed", "1.5", True))
+
+    def test_without_the_rollback_flag_a_lower_version_is_still_not_an_update(self):
+        v = self.verdict("1.5")
+        self.assertEqual((v.kind, v.ok), ("unchanged", False))
+
+    def test_a_different_older_version_is_not_what_was_asked_for(self):
+        v = self.verdict("1.2", downgrade_to="1.5")
+        self.assertEqual((v.kind, v.ok), ("unchanged", False))
+
+    def test_the_version_not_changing_is_not_a_rollback(self):
+        v = self.verdict("2.0", downgrade_to="1.5")
+        self.assertEqual((v.kind, v.ok), ("unchanged", False))
+
+
 if __name__ == "__main__":
     unittest.main()

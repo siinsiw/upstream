@@ -94,6 +94,7 @@ class AppRow(QFrame):
     update_clicked = Signal(str)
     cancel_clicked = Signal(str)
     menu_action = Signal(str, str)
+    selection_changed = Signal(str, bool)     # uid, ticked (only in selectable mode)
 
     def __init__(self, status: AppStatus, skipped: bool, ignored: bool):
         super().__init__()
@@ -284,6 +285,29 @@ class AppRow(QFrame):
         self.cancel_btn.setText(label)
         self.cancel_btn.setToolTip(tip)
         self.cancel_btn.setVisible(bool(label))
+
+    # -- wave 2 hooks: the rows-and-library agent fills these in --------------------------------
+    def set_badges(self, badges) -> None:
+        """Show one chip per badges.Badge (text and tooltip through render(b.text, b.values))."""
+
+    def set_pin(self, pin) -> None:
+        """Show a pin chip for status.pin ({"mode": "hold" or "major", "version": ...}) or hide it (None)."""
+
+    def set_auto_update(self, on: bool) -> None:
+        """State of the checkable Update automatically menu entry (the window owns settings auto_update)."""
+
+    def set_meta(self, size_text: str, date_text: str) -> None:
+        """Extra columns for the All apps tab (already formatted, empty = not shown)."""
+
+    def set_selectable(self, on: bool) -> None:
+        """Show a tick box at the leading edge and emit selection_changed when it changes."""
+
+    @property
+    def selected(self) -> bool:
+        return False
+
+    def set_selected(self, on: bool) -> None:
+        """Set the tick without emitting selection_changed."""
 
     def set_queued(self):
         self.note.hide()

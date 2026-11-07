@@ -172,6 +172,38 @@ class SnapshotTest(unittest.TestCase):
         self.assertEqual(checked, [snapshot])
 
 
+class RollbackTest(unittest.TestCase):
+    def test_winget_is_told_the_version_and_verify_that_it_is_a_rollback(self):
+        status = AppStatus(make_status().app, update=Update("winget", "1.5", "Demo.Demo", winget_mode="rollback"))
+        seen = {}
+
+        def fake_winget(origin, mode, on_progress, on_line, **kwargs):
+            seen["winget"] = (mode, kwargs.get("version"))
+            return 0, ""
+
+        def fake_check(app, before, outcome, expected, cancel=None, **extra):
+            seen["check"] = extra
+            return INSTALLED
+
+        with mock.patch.object(updater.net, "preflight"),              mock.patch.object(updater.running, "close_for_update", lambda *a: None),              mock.patch.object(updater.verify, "snapshot", lambda app: object()),              mock.patch.object(updater.winget, "update", fake_winget),              mock.patch.object(updater.verify, "check", fake_check):
+            ok, _, _, _ = updater.Updater().run(status, lambda *a, **k: None, UpdateContext())
+        self.assertTrue(ok)
+        self.assertEqual(seen["winget"], ("rollback", "1.5"))
+        self.assertEqual(seen["check"], {"downgrade_to": "1.5"})
+
+    def test_an_ordinary_upgrade_sends_neither(self):
+        status = AppStatus(make_status().app, update=Update("winget", "2.0", "Demo.Demo"))
+        seen = {}
+
+        def fake_winget(origin, mode, on_progress, on_line, **kwargs):
+            seen["version"] = kwargs.get("version", "absent")
+            return 0, ""
+
+        with mock.patch.object(updater.net, "preflight"),              mock.patch.object(updater.running, "close_for_update", lambda *a: None),              mock.patch.object(updater.verify, "snapshot", lambda app: object()),              mock.patch.object(updater.winget, "update", fake_winget),              mock.patch.object(updater.verify, "check", lambda app, before, outcome, expected, cancel=None: INSTALLED):
+            updater.Updater().run(status, lambda *a, **k: None, UpdateContext())
+        self.assertIsNone(seen["version"])
+
+
 class DownloadedFileTest(unittest.TestCase):
     """The installer is deleted once its source is finished, whatever happened, unless it may still be running."""
 

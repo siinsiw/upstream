@@ -205,6 +205,50 @@ def show(pkg_id: str) -> dict:
     return meta
 
 
+def parse_versions(lines: list[str]) -> list[str]:
+    """The one-column table `winget show --versions` prints: a header, a dashed line, then a version per line.
+    The header is localised, the dashes are not. Anything else (package not found) gives an empty list."""
+    for i, line in enumerate(lines):
+        if i > 0 and re.fullmatch(r"-{3,}", line.strip()):
+            body = lines[i + 1:]
+            break
+    else:
+        return []
+    found: list[str] = []
+    for line in body:
+        text = line.strip()
+        if not text:
+            break
+        if text not in found:
+            found.append(text)
+    return found
+
+
+def versions(pkg_id: str) -> list[str]:
+    """Every version of a package the winget source has a manifest for, newest first. Slow: call from a thread."""
+    return parse_versions(_run(["show", "--id", pkg_id, "--exact", "--source", "winget", "--versions"], timeout=120))
+
+
+def _update_args(pkg_id: str, mode: str, version: str | None) -> list[str]:
+    """The command line for an upgrade, a first install, or a rollback (`install --version V --force`).
+
+    winget has no downgrade command: a rollback runs the older installer over the newer copy and --force lets it past
+    winget's own "a newer version is already installed" refusal. Whether that works is up to the installer. It cannot
+    work for Store/MSIX packages (Windows refuses to replace a package with an older one), MSI products that block
+    downgrades (error 1638), Burn bundles that do the same (0x80070666), or an app that migrated its data on upgrade;
+    it needs the old version's manifest and installer URL to still exist. Nothing is undone when it fails: the
+    newer copy stays and the installer's exit code is reported."""
+    flags = ["--silent", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
+    if mode == "rollback":
+        if not version:
+            raise ValueError("A rollback needs the version to install")
+        return ["winget", "install", "--id", pkg_id, "--version", version, "--exact", "--source", "winget",
+                "--force", *flags]
+    if mode not in ("upgrade", "install"):
+        raise ValueError(f"Unknown winget mode: {mode!r}")
+    return ["winget", mode, "--id", pkg_id, "--exact", "--source", "winget", *flags]
+
+
 def _kill_tree(proc: subprocess.Popen) -> None:
     """End a winget that has not started installing, and whatever it started: taskkill /T on its pid only."""
     if proc.poll() is not None:
@@ -221,9 +265,11 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_install=None) -> tuple[int, str]:
+def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_install=None,
+           version: str | None = None) -> tuple[int, str]:
     """Run `winget upgrade` (or `install` for a package winget did not match to
-    this machine) and stream its progress. Returns (exit code, last message).
+    this machine, or `install --version` for mode 'rollback', which needs `version`; see _update_args)
+    and stream its progress. Returns (exit code, last message).
 
     `cancel` (a context.CancelToken) ends the run. While winget only prepares and downloads it is terminated with
     everything it started and Cancelled("Cancelled.") is raised. Once the install has begun it is left running
@@ -234,8 +280,7 @@ def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_inst
     the English "Starting package install"."""
     if cancel is not None:
         cancel.check()
-    args = ["winget", mode, "--id", pkg_id, "--exact", "--source", "winget", "--silent",
-            "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"]
+    args = _update_args(pkg_id, mode, version)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             creationflags=CREATE_NO_WINDOW)
     chunks: queue.Queue[bytes | None] = queue.Queue()

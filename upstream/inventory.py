@@ -8,6 +8,7 @@ import re
 import winreg
 from ctypes import wintypes
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 
 UNINSTALL = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
 INSTALLSTATE_UNKNOWN = -1  # msi.h: Windows Installer has no record of the product
@@ -57,8 +58,8 @@ class InstalledApp:
     no_remove: bool = False
     product_code: str | None = None   # the {GUID} subkey of a Windows Installer entry
     system_component: bool = False
-    size_kb: int = 0              # EstimatedSize from the Uninstall key (0 = not reported); details.py fills it
-    install_date: str = ""        # YYYYMMDD from the Uninstall key (or its last-write time); details.py fills it
+    size_kb: int = 0              # EstimatedSize from the Uninstall key (0 = not reported)
+    install_date: str = ""        # YYYYMMDD from the Uninstall key (or its last-write time)
     modify_path: str = ""         # ModifyPath, when the vendor offers a Modify/Change action
     no_modify: bool = False
     no_repair: bool = False
@@ -85,6 +86,37 @@ def _text(key, name: str) -> str:
 
 def _flag(key, name: str) -> bool:
     return _value(key, name) in (1, "1")
+
+
+def _size_kb(key) -> int:
+    """EstimatedSize, in KB. Installers write it as a DWORD or as text; 0xFFFFFFFF is a "don't know".
+    Like _install_date, it never raises: the size is a nicety and must not cost the app its row."""
+    try:
+        value = _value(key, "EstimatedSize")
+        if isinstance(value, str):
+            value = int(value) if value.strip().isdigit() else 0
+        return value if isinstance(value, int) and 0 < value < 0xFFFFFFFF else 0
+    except Exception:
+        return 0
+
+
+def _install_date(key) -> str:
+    """YYYYMMDD: InstallDate when it holds a real date, else when the key was last written (the closest
+    thing Windows keeps for an installer that doesn't record the date). Never raises."""
+    try:
+        raw = _text(key, "InstallDate")
+        found = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", raw) or re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", raw)
+        if found:
+            try:
+                day = date(*map(int, found.groups()))
+            except ValueError:
+                day = None
+            if day and date(1995, 1, 1) <= day <= date.today() + timedelta(days=1):
+                return day.strftime("%Y%m%d")
+        seconds = winreg.QueryInfoKey(key)[2] / 1e7 - 11644473600   # 100 ns steps since 1601 -> Unix time
+        return datetime.fromtimestamp(seconds).strftime("%Y%m%d")
+    except Exception:
+        return ""
 
 
 def _icon_path(raw: str) -> str:
@@ -167,6 +199,11 @@ def _read_entry(key, reg_key: str, scope: str, arch: str) -> InstalledApp | None
         no_remove=_flag(key, "NoRemove"),
         product_code=subkey if is_msi and GUID.fullmatch(subkey) else None,
         system_component=_flag(key, "SystemComponent"),
+        size_kb=_size_kb(key),
+        install_date=_install_date(key),
+        modify_path=_text(key, "ModifyPath"),
+        no_modify=_flag(key, "NoModify"),
+        no_repair=_flag(key, "NoRepair"),
         install_kind=_install_kind(key, subkey, is_msi, f"{uninstall} {quiet}"),
     )
 
