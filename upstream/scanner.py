@@ -46,6 +46,8 @@ class AppStatus:
     fallbacks: list[Update] = field(default_factory=list)
     note: str = ""                  # English template; rendered when shown so a language switch applies
     note_args: dict = field(default_factory=dict)
+    badges: list = field(default_factory=list)      # badges.Badge entries shown on the row (badges.compute)
+    pin: dict | None = None                         # {"mode": "hold"|"major", "version": "1.2.3"} when pinned (pins.py)
 
     @property
     def uid(self) -> str:

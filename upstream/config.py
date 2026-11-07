@@ -91,6 +91,20 @@ class Settings(JsonStore):
             "metered_policy": "ask",          # ask | skip | ignore: downloading on a metered connection
             "battery_policy": "ask",          # ask | skip | ignore: updating while on battery
             "install_timeout_min": 30,        # stop waiting for one installer after this many minutes
+            # --- wave 2 ---
+            "history_enabled": True,          # record installs, updates and uninstalls (history.py)
+            "tray_enabled": False,            # tray icon next to the clock (background.py)
+            "close_to_tray": False,           # closing the window keeps Upstream running in the tray
+            "start_with_windows": False,      # HKCU Run entry; starts minimised to the tray
+            "check_interval_hours": 0,        # scheduled background check; 0 = off
+            "notify_updates": True,           # tray message when a background check finds updates
+            "auto_update": [],                # idents whose updates install by themselves after a background check
+            "pins": {},                       # ident -> {"mode": "hold"|"major", "version": "1.2.3"} (pins.py)
+            "cleanup_backup_days": 30,        # keep leftover-cleanup backups this long (cleanup.py)
+            "cleanup_restore_point": True,    # try to create a Windows restore point before a cleanup
+            "security_badges": True,          # security / end-of-life badges on rows (badges.py)
+            "export_dir": "",                 # last folder used by Export
+            "last_tab": "updates",            # tab shown at start
         })
 
     def override(self, ident: str) -> dict:
@@ -136,6 +150,7 @@ class Cache(JsonStore):
         super().__init__(DATA_DIR / "cache.json", {
             "winget_meta": {},   # winget id -> {repo, installer_url, installer_type, homepage, version, ts}
             "github": {},        # owner/repo -> {etag, releases, ts}
+            "eol": {},           # endoflife.date product -> {cycles, ts} (badges.py)
         })
 
     def entry(self, section: str, key: str) -> dict | None:

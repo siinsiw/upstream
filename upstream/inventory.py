@@ -57,6 +57,11 @@ class InstalledApp:
     no_remove: bool = False
     product_code: str | None = None   # the {GUID} subkey of a Windows Installer entry
     system_component: bool = False
+    size_kb: int = 0              # EstimatedSize from the Uninstall key (0 = not reported); details.py fills it
+    install_date: str = ""        # YYYYMMDD from the Uninstall key (or its last-write time); details.py fills it
+    modify_path: str = ""         # ModifyPath, when the vendor offers a Modify/Change action
+    no_modify: bool = False
+    no_repair: bool = False
     install_kind: str = ""        # installer framework of this copy, as installer.detect() names it; '' when the
                                   # Uninstall key can't tell (inplace.installed_kind then reads the uninstaller file)
 

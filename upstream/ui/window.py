@@ -387,6 +387,24 @@ class MainWindow(QMainWindow):
             self.icon_cache[key] = pixmap if pixmap and not pixmap.isNull() else letter_avatar(app.name)
         return self.icon_cache[key]
 
+    # -- API for the background feature, the single-instance hand-over and the tray --------
+    def pending_updates(self) -> list[str]:
+        return self._pending_updates()
+
+    def is_busy(self) -> bool:
+        return bool(self.scanning or self.active_jobs or uninstalls_running())
+
+    def show_and_raise(self):
+        """Bring the window to the front, also from the tray or from a second launch."""
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        QApplication.quit()
+
     def _pending_updates(self) -> list[str]:
         out = []
         for i in range(self.lists["updates"].count()):

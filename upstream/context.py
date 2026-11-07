@@ -50,6 +50,7 @@ class UpdateContext:
     cancel: CancelToken = field(default_factory=CancelToken)
     ask_fn: Callable[[Question], bool] | None = None
     bulk: bool = False            # the job is part of "Update all"
+    auto: bool = False            # started by an automatic-update rule while nobody is watching: never asks
 
     def setting(self, key: str, default=None):
         return self.settings.get(key, default) if self.settings is not None else default
@@ -58,7 +59,7 @@ class UpdateContext:
             danger: bool = False, **values) -> bool:
         """Block the worker thread until the user answers. With no UI attached the answer is No."""
         self.cancel.check()
-        if self.ask_fn is None:
+        if self.auto or self.ask_fn is None:
             return False
         answer = bool(self.ask_fn(Question(template, values, yes, no, detail, danger)))
         self.cancel.check()
