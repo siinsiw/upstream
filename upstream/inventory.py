@@ -26,6 +26,10 @@ _IDENT_NOISE = re.compile(
 GUID = re.compile(r"\{[0-9A-F]{8}-(?:[0-9A-F]{4}-){3}[0-9A-F]{12}\}", re.I)
 _HIVES = {label: (hive, view) for hive, label, view, _scope, _arch in _VIEWS}
 _msi = None
+# What each framework leaves in its Uninstall key (see _install_kind).
+_BURN_VALUES = ("BundleProviderKey", "BundleCachePath", "BundleVersion", "BundleUpgradeCode")
+_INNO_UNINSTALLER = re.compile(r"unins\d{3}\.exe", re.I)
+_SQUIRREL_UNINSTALL = re.compile(r'update\.exe"?\s+--uninstall', re.I)
 
 
 def make_ident(name: str) -> str:
@@ -53,7 +57,8 @@ class InstalledApp:
     no_remove: bool = False
     product_code: str | None = None   # the {GUID} subkey of a Windows Installer entry
     system_component: bool = False
-    install_kind: str = ""        # installer framework of this copy (inno, nullsoft, msi, burn, ...); inplace.py
+    install_kind: str = ""        # installer framework of this copy, as installer.detect() names it; '' when the
+                                  # Uninstall key can't tell (inplace.installed_kind then reads the uninstaller file)
 
     @property
     def ident(self) -> str:
@@ -100,6 +105,25 @@ def _guess_arch(location: str, icon: str) -> str:
     return "x86" if "program files (x86)" in probe else "x64"
 
 
+def _install_kind(key, subkey: str, is_msi: bool, commands: str) -> str:
+    """Installer framework of this copy from what its Uninstall key says, in the names installer.detect()
+    returns. NSIS leaves nothing here; only its uninstaller file gives it away (inplace.installed_kind)."""
+    name, low = subkey.lower(), commands.lower()
+    if any(_value(key, v) is not None for v in _BURN_VALUES):
+        return "burn"
+    if is_msi:
+        return "msi"
+    if name.endswith("_is1") or _value(key, "Inno Setup: Setup Version") is not None or _INNO_UNINSTALLER.search(low):
+        return "inno"
+    if name.startswith("installshield_") or "installshield installation information" in low:
+        return "installshield"
+    if _SQUIRREL_UNINSTALL.search(low):
+        return "squirrel"
+    if GUID.fullmatch(subkey) and "msiexec" in low:
+        return "msi"
+    return ""
+
+
 def _read_entry(key, reg_key: str, scope: str, arch: str) -> InstalledApp | None:
     name = _text(key, "DisplayName")
     if not name:
@@ -121,6 +145,7 @@ def _read_entry(key, reg_key: str, scope: str, arch: str) -> InstalledApp | None
     urls = [u for u in (_text(key, v) for v in _URL_VALUES) if u]
     is_msi = _value(key, "WindowsInstaller") == 1
     subkey = reg_key.rsplit("\\", 1)[-1]
+    uninstall, quiet = _text(key, "UninstallString"), _text(key, "QuietUninstallString")
     return InstalledApp(
         reg_key=reg_key,
         name=name,
@@ -132,11 +157,12 @@ def _read_entry(key, reg_key: str, scope: str, arch: str) -> InstalledApp | None
         icon_path=icon,
         urls=urls,
         is_msi=is_msi,
-        uninstall_string=_text(key, "UninstallString"),
-        quiet_uninstall_string=_text(key, "QuietUninstallString"),
+        uninstall_string=uninstall,
+        quiet_uninstall_string=quiet,
         no_remove=_flag(key, "NoRemove"),
         product_code=subkey if is_msi and GUID.fullmatch(subkey) else None,
         system_component=_flag(key, "SystemComponent"),
+        install_kind=_install_kind(key, subkey, is_msi, f"{uninstall} {quiet}"),
     )
 
 

@@ -15,6 +15,8 @@ _FSI, _PDI = "⁨", "⁩"   # first-strong isolate: keeps "3.9.0+38" or English 
 SOURCE_LABELS = {"github": "GitHub", "winget": "Official site · winget", "site": "Official site"}
 # Stored message arguments that are themselves translatable (a source label, a known error message).
 _TRANSLATED_ARGS = {"source", "error"}
+# Stored arguments that are plain quantities: Persian shows them with Persian digits.
+_NUMBER_ARGS = {"percent", "minutes"}
 
 FA = {
     # window
@@ -400,7 +402,8 @@ def render(template: str, args: dict | None = None) -> str:
     """Translate a stored (English template, args) pair in the current language."""
     if not template:
         return ""
-    args = {k: tr(v) if k in _TRANSLATED_ARGS and isinstance(v, str) else v for k, v in (args or {}).items()}
+    args = {k: tr(v) if k in _TRANSLATED_ARGS and isinstance(v, str)
+            else num(v) if k in _NUMBER_ARGS else v for k, v in (args or {}).items()}
     return tr(template, **args)
 
 

@@ -7,7 +7,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
-from . import net
+from . import installer, net
 from .config import Cache, Settings, migrate_legacy, setup_logging
 from .i18n import LANGUAGES
 from .ui.locale import apply_language
@@ -23,6 +23,21 @@ def _clean_settings(settings: Settings):
         settings.set("theme", "system")
     if settings.get("language") not in LANGUAGES:
         settings.set("language", "en")
+    for key, allowed in (("publisher_policy", ("ask", "block", "off")),
+                         ("close_apps_policy", ("ask", "auto", "never")),
+                         ("metered_policy", ("ask", "skip", "ignore")),
+                         ("battery_policy", ("ask", "skip", "ignore"))):
+        if settings.get(key) not in allowed:
+            settings.set(key, "ask")
+    proxy = settings.get("proxy")
+    if not (isinstance(proxy, dict) and proxy.get("mode") in ("system", "none", "custom")
+            and isinstance(proxy.get("url", ""), str)):
+        settings.set("proxy", {"mode": "system", "url": ""})
+    timeout = settings.get("install_timeout_min")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+        settings.set("install_timeout_min", 30)
+    if not isinstance(settings.get("signers"), dict):
+        settings.set("signers", {})
 
 
 def main() -> int:
@@ -31,6 +46,7 @@ def main() -> int:
     settings = Settings()
     _clean_settings(settings)
     net.configure(settings)
+    installer.configure(settings)
 
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     try:

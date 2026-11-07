@@ -12,6 +12,19 @@ Each source goes through the same steps, and each step lives in its own module:
     exitcodes.classify   what the exit code means
     verify.check         what really changed on the PC
 
+What a source's outcome does to the run:
+
+    ok, restart          verify.check decides. Installed, restart, side by side and unknown end the run as done;
+                         unchanged ends it as a failure that keeps the update offered, without trying another
+                         source (a setup window the user closed also exits 0)
+    cancelled            ends the run; no other source starts
+    busy                 the same installer is run again a few times while Windows finishes the other installation
+                         (the cancel token ends the wait), then the run ends: another source would meet the same lock
+    already_installed,   done only if verify.check finds the new version listed; otherwise the next source is tried
+    newer_present
+    disk_full            ends the run; no other source has more room
+    needs_admin, failed  the next source is tried, and the last error is what the row shows
+
 Messages travel as (English template, values) pairs and are translated by the
 UI when shown, so switching language mid-install re-renders them correctly."""
 from __future__ import annotations
@@ -25,6 +38,11 @@ from .i18n import SOURCE_LABELS, english
 from .scanner import AppStatus, Update
 
 log = logging.getLogger("upstream.update")
+
+BUSY_RETRIES = 6            # times the installer is run again while another installation holds Windows Installer
+BUSY_WAIT_SECONDS = 20
+_APPLIED = ("installed", "restart", "side_by_side")   # verdicts that show the new version is on the PC
+_NO_FALLBACK = ("busy", "disk_full")                  # no other source would fare better
 
 KIND_LABELS = {
     "msi": "MSI", "msix": "MSIX", "inno": "Inno Setup", "nullsoft": "NSIS", "burn": "WiX Burn",
@@ -71,14 +89,17 @@ class Updater:
             if outcome.cancelled:
                 # The user stopped it (closed the installer, declined UAC): do not start another source.
                 return False, outcome.template or "Cancelled.", outcome.values, app.version
-            if outcome.ok:
+            if outcome.ok or outcome.present:
                 verdict = verify.check(app, before, outcome, upd.version)
                 log.info("%s: %s (%s)", app.name, verdict.kind, english(verdict.template, verdict.values))
-                if signer and verdict.kind in ("installed", "restart"):
-                    trust.remember(ctx.settings, app, signer)
-                return verdict.ok, verdict.template, verdict.values, verdict.version
+                if outcome.ok or verdict.kind in _APPLIED:
+                    if signer and verdict.kind in ("installed", "restart"):
+                        trust.remember(ctx.settings, app, signer)
+                    return verdict.ok, verdict.template, verdict.values, verdict.version
             error = (outcome.template, outcome.values)
             log.warning("%s: %s failed: %s", app.name, upd.source, english(*error))
+            if outcome.kind in _NO_FALLBACK:
+                break
             if index + 1 < len(attempts):
                 progress("{source} failed, trying the next source…", -1,
                          source=SOURCE_LABELS.get(upd.source, upd.source))
@@ -120,20 +141,44 @@ class Updater:
             raise installer.InstallError(plan.refuse[0], **plan.refuse[1])
 
         running.close_for_update(ctx, app, progress)
-        progress("Installing" if kind != "exe" else "Setup window opened", -1)
-        code = installer.install(path, kind, app.scope, plan, ctx.cancel)
-        outcome = exitcodes.classify(code, kind)
-        log.info("%s: installer exit code %s -> %s", app.name, code, outcome.kind)
+
+        def attempt() -> Outcome:
+            progress("Installing" if kind != "exe" else "Setup window opened", -1)
+            code = installer.install(path, kind, app.scope, plan, ctx.cancel)
+            result = exitcodes.classify(code, kind)
+            log.info("%s: installer exit code %s -> %s", app.name, code, result.kind)
+            return result
+
+        outcome = self._while_busy(attempt, progress, ctx)
         if outcome.ok:
             path.unlink(missing_ok=True)
-        return outcome, signer
+        # Only a verified signature may become the app's remembered publisher.
+        return outcome, (signer if sig_status == "Valid" else "")
 
     def _winget(self, app, upd: Update, progress, ctx: UpdateContext) -> Outcome:
         running.close_for_update(ctx, app, progress)
-        progress("Preparing (winget)", -1)
-        code, last = winget.update(
-            upd.origin, upd.winget_mode,
-            lambda pct: progress("Downloading (winget)", pct),
-            lambda line: log.info("winget %s: %s", upd.origin, line),
-        )
-        return exitcodes.classify_winget(code, last)
+
+        def attempt() -> Outcome:
+            progress("Preparing (winget)", -1)
+            code, last = winget.update(
+                upd.origin, upd.winget_mode,
+                lambda pct: progress("Downloading (winget)", pct),
+                lambda line: log.info("winget %s: %s", upd.origin, line),
+            )
+            return exitcodes.classify_winget(code, last)
+
+        return self._while_busy(attempt, progress, ctx)
+
+    @staticmethod
+    def _while_busy(attempt, progress, ctx: UpdateContext) -> Outcome:
+        """Run `attempt()`, which returns an Outcome. While Windows reports another installation in progress
+        (a Windows Update, say) wait and run it again; cancelling ends the wait at once."""
+        outcome = attempt()
+        for _ in range(BUSY_RETRIES):
+            if not outcome.busy:
+                break
+            progress("Another installation is running, waiting…", -1)
+            ctx.cancel.wait(BUSY_WAIT_SECONDS)
+            ctx.cancel.check()
+            outcome = attempt()
+        return outcome

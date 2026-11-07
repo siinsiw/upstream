@@ -12,10 +12,11 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from functools import cmp_to_key
 
 from . import net
 from .inventory import InstalledApp
-from .versioning import is_newer, parse_version
+from .versioning import clean, compare, is_newer, is_prerelease, parse_version
 
 log = logging.getLogger("upstream.github")
 
@@ -24,42 +25,162 @@ USER_AGENT = "Upstream-Updater/1.0"
 CREATE_NO_WINDOW = 0x08000000
 CACHE_FRESH_SECONDS = 15 * 60
 
-_REPO_RE = re.compile(r"github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)", re.I)
+# github.com or www.github.com only (not api., gist. or raw.), then owner, repo and the rest of the path.
+_GITHUB_URL = re.compile(
+    r"(?<![\w.-])(?:www\.)?github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)([^\s?#\"'<>]*)",
+    re.I)
 _NOT_REPO_OWNERS = {
     "sponsors", "orgs", "settings", "marketplace", "features", "topics", "apps", "login",
     "about", "pricing", "enterprise", "notifications", "users", "site", "collections", "search",
+    "repos", "gist", "explore", "trending", "security", "readme", "contact", "customer-stories",
+    "solutions", "resources", "join", "new", "pulls", "issues", "codespaces", "account",
 }
 
 _INSTALLABLE = (".msi", ".exe", ".msix", ".msixbundle", ".appx", ".appxbundle")
 _NOT_WINDOWS = re.compile(r"linux|ubuntu|debian|fedora|centos|darwin|macos|\bmac\b|osx|apple|android|\bios\b|freebsd", re.I)
 _NOT_INSTALLER = re.compile(r"portable|symbols?|debug|\bpdb\b|sources?\b|\bsrc\b|uninstall|delta|blockmap", re.I)
+# Runtimes a project ships beside its own setup; installing one of them is never the update.
+_PREREQUISITE = re.compile(r"vc_?redist|dotnet-|windowsdesktop-runtime|webview2|directx", re.I)
+_MACHINE_WIDE = re.compile(r"all[-_ ]?users|per[-_ ]?machine|(?<![a-z])(?:machine|system|admin)(?![a-z])")
 # Many projects publish betas without ticking GitHub's "pre-release" box.
 _PRE_TAG = re.compile(r"(?<![a-z])(alpha|beta|rc|pre|preview|nightly|dev|canary|insiders?|snapshot)(?![a-z])", re.I)
 
+# --- which repository belongs to an app ---
+_NOISE = re.compile(
+    r"\bv?\d+(?:[.\-_]\d+)+(?:\+\d+|\(\d+\))?|\bversion\b|\(?\b(?:x64|x86|amd64|arm64|64-bit|32-bit|win64|win32)\b\)?",
+    re.I)
+_COMPANY_WORDS = {
+    "inc", "llc", "ltd", "gmbh", "corp", "corporation", "co", "company", "limited", "plc", "foundation", "team",
+    "project", "software", "technologies", "technology", "the", "and", "org", "community", "development",
+    "developers", "contributors", "group", "systems",
+}
+_GENERIC_WORDS = {
+    "the", "for", "and", "of", "app", "apps", "desktop", "client", "windows", "win", "setup", "installer",
+    "install", "edition", "free", "portable", "version", "bit", "en", "us", "with",
+}
+# A repository named like this is about the app, not the app itself.
+_OTHER_PRODUCT = {
+    "android", "ios", "iphone", "macos", "mac", "osx", "linux", "web", "website", "docs", "doc", "documentation",
+    "wiki", "blog", "plugin", "plugins", "extension", "extensions", "addon", "addons", "theme", "themes", "sdk",
+    "api", "translations", "l10n", "i18n", "sample", "samples", "example", "examples", "demo", "tests", "test",
+    "benchmark", "mirror", "archive", "legacy", "packaging", "homebrew", "scoop", "chocolatey", "winget",
+    "flatpak", "snap", "aur", "bot",
+}
+_SITE_REPO = re.compile(
+    r"\.github\.io$|^(?:homebrew|scoop|chocolatey|awesome)-|^(?:docs?|www|site|website|wiki|blog)$", re.I)
+_ACCEPT_SCORE = 45  # points a repo needs from the links that mention it plus how well it fits the app
+_NEAR = 40          # candidates this close to the best are told apart by their releases
+_VERIFY_AT_MOST = 3
 
-def _date_like(version: str | None) -> bool:
-    parsed = parse_version(version)
-    return bool(parsed) and 1990 <= parsed[0] <= 2100
+
+def _repo_refs(url: str):
+    """(owner/repo, rest of the path) for each repository a URL points into."""
+    for m in _GITHUB_URL.finditer(url or ""):
+        owner, repo = m.group(1), re.sub(r"\.git$", "", m.group(2), flags=re.I)
+        if owner.lower() in _NOT_REPO_OWNERS or not repo or repo.startswith("."):
+            continue
+        if (owner.lower(), repo.lower()) == ("microsoft", "winget-pkgs"):
+            continue
+        yield f"{owner}/{repo}", m.group(3)
 
 
 def repo_from_urls(urls) -> str | None:
-    """First plausible owner/repo in the given URLs. A release-download URL wins
-    over a homepage because it proves where the installer comes from."""
+    """First plausible owner/repo in the given URLs, whatever app it belongs to. A release-download
+    URL wins over a homepage because it proves where the installer comes from."""
     fallback = None
     for url in urls:
-        if not url:
-            continue
-        for m in _REPO_RE.finditer(url):
-            owner, repo = m.group(1), re.sub(r"\.git$", "", m.group(2))
-            if owner.lower() in _NOT_REPO_OWNERS or not repo or repo.startswith("."):
-                continue
-            if (owner.lower(), repo.lower()) == ("microsoft", "winget-pkgs"):
-                continue
-            candidate = f"{owner}/{repo}"
-            if "/releases/download/" in url.lower():
-                return candidate
-            fallback = fallback or candidate
+        for repo, rest in _repo_refs(url):
+            if rest.lower().startswith("/releases/download/"):
+                return repo
+            fallback = fallback or repo
     return fallback
+
+
+def _words(text: str) -> list[str]:
+    spaced = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", _NOISE.sub(" ", text or "").replace("+", " plus "))
+    return [w for w in re.findall(r"[a-z0-9]+", spaced.lower()) if len(w) > 1 or w.isdigit()]
+
+
+def _compact(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", _NOISE.sub(" ", text or "").replace("+", "plus").lower())
+
+
+def _closeness(a: str, b: str) -> int:
+    """60 for the same name, 40 when one holds most of the other (powertoys / microsoftpowertoys), else 0."""
+    if not a or not b:
+        return 0
+    if a == b:
+        return 60
+    short, long_ = sorted((a, b), key=len)
+    return 40 if short in long_ and len(short) >= 5 and len(short) * 5 >= len(long_) * 2 else 0
+
+
+@dataclass
+class _Profile:
+    names: list[str]            # compact spellings of the app's name: display name, without publisher, winget package
+    words: set[str]             # the words of those names that say something
+    publishers: list[str]       # compact spellings of the publisher
+    publisher_words: set[str]
+
+
+def _profile(app: InstalledApp, winget_id: str | None) -> _Profile:
+    publisher_id, _, package = (winget_id or "").partition(".")
+    publisher_words = {w for w in _words(f"{app.publisher} {publisher_id}") if w not in _COMPANY_WORDS}
+    name_words = _words(app.name)
+    words = {w for w in (*name_words, *_words(package)) if w not in _GENERIC_WORDS and w not in publisher_words}
+    names = {_compact(app.name), "".join(w for w in name_words if w not in publisher_words), _compact(package)}
+    publishers = {_compact(" ".join(w for w in _words(app.publisher) if w not in _COMPANY_WORDS)),
+                  _compact(publisher_id)}
+    return _Profile([n for n in names if len(n) > 1], words, [p for p in publishers if len(p) > 1], publisher_words)
+
+
+def _url_weight(rest: str) -> int:
+    """How much a link says about the repo: a release download proves the installer lives there."""
+    path = rest.lower()
+    if path.startswith("/releases/download/"):
+        return 40
+    if path.startswith("/releases"):
+        return 20
+    if path.startswith(("/issues", "/discussions", "/wiki", "/blob/", "/tree/", "/raw/")):
+        return 12
+    return 10
+
+
+@dataclass(frozen=True)
+class RepoCandidate:
+    repo: str
+    score: int
+
+
+def rank_repos(app: InstalledApp, urls, winget_id: str | None = None) -> list[RepoCandidate]:
+    """The repositories the URLs point to that plausibly are this app's, best first. A link alone proves
+    nothing (help pages link sponsors, docs and other projects): the repo must also look like the app by
+    name or owner, unless the link is a release download from an owner that matches the publisher."""
+    found: dict[str, tuple[str, list[int]]] = {}
+    for url in urls:
+        for repo, rest in _repo_refs(url):
+            found.setdefault(repo.lower(), (repo, []))[1].append(_url_weight(rest))
+    profile = _profile(app, winget_id)
+    ranked = []
+    for repo, weights in found.values():
+        owner, name = repo.split("/", 1)
+        proof = max(weights) + min(10, 5 * (len(weights) - 1))
+        repo_words = set(_words(name))
+        shared = repo_words & profile.words
+        spoken_for = shared and shared >= repo_words - _GENERIC_WORDS   # hiddify-app: its every word is in the name
+        by_repo = max(max((_closeness(_compact(name), n) for n in profile.names), default=0),
+                      40 if spoken_for else min(40, 20 * len(shared)))
+        owner_c = _compact(owner)
+        by_owner = 30 if owner_c in profile.names else 0   # telegramdesktop/tdesktop for Telegram Desktop
+        published = max(max((_closeness(owner_c, p) for p in profile.publishers), default=0) * 5 // 12,
+                        min(24, 12 * len(set(_words(owner)) & profile.publisher_words)))
+        named = max(by_repo, by_owner)
+        penalty = 100 if _SITE_REPO.search(name) else 50 if (repo_words & _OTHER_PRODUCT) - profile.words else 0
+        score = named + published + proof - penalty
+        if score >= _ACCEPT_SCORE and (named >= 20 or (proof >= 40 and published >= 12)):
+            ranked.append(RepoCandidate(repo, score))
+    ranked.sort(key=lambda c: -c.score)
+    return ranked
 
 
 def discover_token(use_gh_cli: bool) -> str | None:
@@ -109,7 +230,7 @@ class Release:
     @property
     def version(self) -> str:
         if parse_version(self.tag):
-            return re.sub(r"^[^\d]*", "", self.tag) or self.tag
+            return clean(self.tag)
         return self.title or self.tag
 
 
@@ -119,6 +240,7 @@ class CheckResult:
     release: Release | None
     asset: Asset | None
     installer_type: str | None
+    incomparable: str | None = None   # newest release when none of them could be compared with the installed version
 
 
 def _shape(name: str) -> str:
@@ -136,8 +258,34 @@ def _arch_of(name: str) -> str | None:
     return None
 
 
+def _asset_kind(asset: Asset, assets: list[Asset]) -> str:
+    """Installer family when the release gives it away: the extension, a Squirrel RELEASES/.nupkg beside
+    its Setup.exe, the .blockmap electron-builder writes beside an NSIS installer. '' when it can't tell."""
+    n = asset.name.lower()
+    if n.endswith(".msi"):
+        return "msi"
+    if n.endswith((".msix", ".msixbundle", ".appx", ".appxbundle")):
+        return "msix"
+    names = {a.name.lower() for a in assets}
+    if f"{n}.blockmap" in names:
+        return "nullsoft"
+    if "releases" in names or any(x.endswith(".nupkg") for x in names):
+        return "squirrel"
+    return ""
+
+
+def _family(kind: str) -> str:
+    return kind if kind in ("msi", "msix") else "exe"
+
+
+def _mentions_app(asset_name: str, app: InstalledApp) -> bool:
+    flat = _compact(asset_name)
+    return any(w in flat for w in _words(app.name) if w not in _GENERIC_WORDS and len(w) >= 3)
+
+
 def pick_asset(assets: list[Asset], app: InstalledApp, arch: str, hint_name: str | None = None) -> Asset | None:
     hint = _shape(hint_name) if hint_name else None
+    have = app.install_kind or ("msi" if app.is_msi else "")
     best, best_score = None, None
     for asset in assets:
         n = asset.name.lower()
@@ -158,6 +306,17 @@ def pick_asset(assets: list[Asset], app: InstalledApp, arch: str, hint_name: str
         else:
             score += 8
 
+        if have:
+            kind = _asset_kind(asset, assets)
+            if _family(kind or ext.lstrip(".")) != _family(have):
+                score -= 15
+            else:
+                score += 20
+                if kind and kind != have and _family(kind) == "exe":
+                    score -= 20     # a Squirrel setup over an Inno install would leave a second copy
+                elif kind == have:
+                    score += 10
+
         want = "arm64" if arch == "arm64" else (app.arch or "x64")
         if asset_arch is None:
             score += 6
@@ -172,8 +331,14 @@ def pick_asset(assets: list[Asset], app: InstalledApp, arch: str, hint_name: str
             score += 10
         if re.search(r"win(dows)?(?![a-z])|win64|win32", n):
             score += 4
-        if "user" in n:
-            score += 6 if app.scope == "user" else -6
+        machine = _MACHINE_WIDE.search(n) is not None
+        per_user = not machine and "user" in n
+        if per_user or machine:
+            score += 12 if (per_user and app.scope == "user") or (machine and app.scope == "machine") else -12
+        if _mentions_app(n, app):
+            score += 10
+        elif _PREREQUISITE.search(n):
+            score -= 25
 
         if best_score is None or score > best_score:
             best, best_score = asset, score
@@ -245,20 +410,41 @@ class GitHub:
             self.cache.put("github", repo, {"etag": etag, "releases": raw})
         return [Release(**{**r, "assets": [Asset(**a) for a in r["assets"]]}) for r in raw]
 
+    def discover(self, app: InstalledApp, urls, winget_id: str | None = None, arch: str | None = None) -> str | None:
+        """The repo to check for this app. Usually the one candidate its links leave; when several fit
+        about equally, the one whose recent releases carry a Windows installer for this app wins."""
+        ranked = rank_repos(app, urls, winget_id)
+        near = [c for c in ranked if ranked[0].score - c.score <= _NEAR][:_VERIFY_AT_MOST] if ranked else []
+        if len(near) < 2:
+            return near[0].repo if near else None
+        arch = arch or machine_arch()
+        return max(near, key=lambda c: c.score + self._installer_evidence(c.repo, app, arch)).repo
+
+    def _installer_evidence(self, repo: str, app: InstalledApp, arch: str) -> int:
+        try:
+            releases = [r for r in self.releases(repo) if not r.draft][:5]
+        except (RateLimited, urllib.error.URLError, OSError, ValueError) as e:
+            log.debug("could not read the releases of %s to compare candidates: %s", repo, e)
+            return 0
+        for release in releases:
+            asset = pick_asset(release.assets, app, arch)
+            if asset:
+                return 25 + (10 if _mentions_app(asset.name, app) else 0)
+        return -25
+
     def check(self, repo: str, app: InstalledApp, arch: str, hint_url: str | None = None,
               hint_type: str | None = None, force: bool = False) -> CheckResult:
-        def usable(r: Release) -> bool:
+        def offered(r: Release) -> bool:
             if r.draft or not parse_version(r.version):
                 return False
-            if not self.include_prereleases and (r.prerelease or _PRE_TAG.search(r.tag)):
-                return False
-            # 2026.11.02 vs 8.0.1: different numbering schemes, comparing them means nothing.
-            return not app.version or _date_like(r.version) == _date_like(app.version)
+            return self.include_prereleases or not (r.prerelease or _PRE_TAG.search(r.tag) or is_prerelease(r.version))
 
-        candidates = [r for r in self.releases(repo, force) if usable(r)]
-        candidates.sort(key=lambda r: parse_version(r.version), reverse=True)
+        listed = [r for r in self.releases(repo, force) if offered(r)]
+        # 2026.11.02 vs 8.0.1: different numbering schemes, comparing them means nothing.
+        candidates = [r for r in listed if not app.version or compare(r.version, app.version) is not None]
+        candidates.sort(key=cmp_to_key(lambda a, b: compare(a.version, b.version) or 0), reverse=True)
         if not candidates:
-            return CheckResult(None, None, None, None)
+            return CheckResult(None, None, None, None, listed[0].version if listed else None)
 
         hint_name = None
         if hint_url and f"github.com/{repo.lower()}/releases/download/" in hint_url.lower():

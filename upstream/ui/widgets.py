@@ -82,6 +82,7 @@ class ElidedLabel(QLabel):
 
 class AppRow(QFrame):
     update_clicked = Signal(str)
+    cancel_clicked = Signal(str)
     menu_action = Signal(str, str)
 
     def __init__(self, status: AppStatus, skipped: bool, ignored: bool):
@@ -124,21 +125,30 @@ class AppRow(QFrame):
         lay.addLayout(versions)
 
         self.actions = QStackedWidget()
-        self.actions.setFixedWidth(184)
+        self.actions.setFixedWidth(240)
         self.button = QPushButton(tr("Update"))
         self.button.setObjectName("rowAction")
         self.button.setProperty("tone", "accent")
         self.button.setCursor(Qt.PointingHandCursor)
         self.button.clicked.connect(lambda: self.update_clicked.emit(self.uid))
+        # Shown beside the button after the user cancelled: a neutral note, the update stays on offer.
+        self.note = QLabel()
+        self.note.setProperty("tone", "muted")
+        self.note.hide()
         holder = QWidget()
         hl = QHBoxLayout(holder)
         hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(10)
         hl.addStretch(1)
+        hl.addWidget(self.note)
         hl.addWidget(self.button)
         self.actions.addWidget(holder)
 
         prog = QWidget()
-        pl = QVBoxLayout(prog)
+        outer = QHBoxLayout(prog)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(8)
+        pl = QVBoxLayout()
         pl.setContentsMargins(0, 0, 0, 0)
         pl.setSpacing(5)
         # Phase text elides; the percentage has its own label so it is never cut off.
@@ -157,6 +167,19 @@ class AppRow(QFrame):
         pl.addLayout(phase_row)
         pl.addWidget(self.bar)
         pl.addStretch(1)
+        outer.addLayout(pl, 1)
+        self.cancel_btn = QPushButton()
+        self.cancel_btn.setObjectName("link")
+        self.cancel_btn.setCursor(Qt.PointingHandCursor)
+        self.cancel_btn.clicked.connect(lambda: self.cancel_clicked.emit(self.uid))
+        # Room for the longer label, kept when it is hidden, so every bar in the list ends at the same place.
+        self.cancel_btn.ensurePolished()   # the stylesheet sets the font size, so measure after it applies
+        fm = self.cancel_btn.fontMetrics()
+        self.cancel_btn.setFixedWidth(max(fm.horizontalAdvance(tr(t)) for t in ("Cancel", "Stop waiting")) + 20)
+        policy = self.cancel_btn.sizePolicy()
+        policy.setRetainSizeWhenHidden(True)
+        self.cancel_btn.setSizePolicy(policy)
+        outer.addWidget(self.cancel_btn, 0, Qt.AlignVCenter)
         self.actions.addWidget(prog)
 
         self.state = QLabel()
@@ -228,13 +251,24 @@ class AppRow(QFrame):
     def set_icon(self, pixmap):
         self.icon.setPixmap(pixmap)
 
+    def _cancel_control(self, label: str = "", tip: str = ""):
+        """The link beside the progress bar; no label hides it (a recheck, or a stop already under way)."""
+        self.cancel_btn.setText(label)
+        self.cancel_btn.setToolTip(tip)
+        self.cancel_btn.setVisible(bool(label))
+
     def set_queued(self):
+        self.note.hide()
         self.phase.set_full_text(tr("Queued"))
         self.pct.clear()
         self.bar.setRange(0, 0)
+        self._cancel_control(tr("Cancel"))
         self.actions.setCurrentIndex(1)
 
-    def set_progress(self, text: str, pct: int):
+    def set_progress(self, text: str, pct: int, cancel: str = ""):
+        """`cancel` is "cancel" (the work stops), "wait" (the installer keeps running; only the waiting
+        stops) or "" (nothing to cancel)."""
+        self.note.hide()
         self.phase.set_full_text(text)
         self.pct.setText(tr("{pct}%", pct=num(pct)) if pct >= 0 else "")
         if pct < 0:
@@ -242,9 +276,32 @@ class AppRow(QFrame):
         else:
             self.bar.setRange(0, 100)
             self.bar.setValue(pct)
+        if cancel == "wait":
+            self._cancel_control(tr("Stop waiting"),
+                                 tr("Upstream stops waiting and moves on. The installer itself is not stopped."))
+        else:
+            self._cancel_control(tr("Cancel") if cancel else "")
         self.actions.setCurrentIndex(1)
 
+    def set_cancelling(self):
+        self.note.hide()
+        self.phase.set_full_text(tr("Cancelling…"))
+        self.pct.clear()
+        self.bar.setRange(0, 0)
+        self._cancel_control()
+        self.actions.setCurrentIndex(1)
+
+    def set_cancelled(self, message: str):
+        """Not a failure: the user stopped it, so the row goes back to offering the update."""
+        self.note.setText(tr("Cancelled"))
+        self.note.show()
+        self.button.setText(tr("Update"))
+        self.actions.setCurrentIndex(0)
+        self.setToolTip(message)
+        self.state.setToolTip(message)
+
     def set_result(self, ok: bool, message: str, version: str):
+        self.note.hide()
         if ok:
             self.old_ver.setText(version)
             self.arrow.hide()

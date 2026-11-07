@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import threading
+import time
 from datetime import datetime
 from functools import partial
 
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..context import CancelToken, Question, UpdateContext
-from ..i18n import english, num, render, tr, trn
+from ..i18n import N_, english, num, render, tr, trn
 from ..scanner import AppStatus, Scanner
 from ..updater import Updater
 from .locale import apply_language as apply_qt_language
@@ -29,6 +30,11 @@ from .widgets import AppRow, SourceDialog
 log = logging.getLogger("upstream.ui")
 
 TABS = {"updates": "Updates", "all": "All apps", "ignored": "Ignored"}
+# Progress messages (updater.py) shown while an installer runs; cancelling then only stops the waiting.
+INSTALL_PHASES = frozenset({"Installing", "Setup window opened"})
+# Seconds a cancelled update gets to stop by itself (a download does, in a moment) before the queue
+# moves on without it. Steps that ignore the token, such as winget, are left to finish in the background.
+WIND_DOWN = 2.0
 
 
 class Bus(QObject):
@@ -77,10 +83,13 @@ class MainWindow(QMainWindow):
         # Apps uninstalled since the last check. A check that began earlier still lists them.
         self.removed: set[str] = set()
         # Last thing each row showed, kept here because populate() rebuilds rows:
-        # ("queued",) | ("progress", template, values, pct) | ("result", ok, template, values, version)
+        # ("queued",) | ("progress", template, values, pct) | ("cancelling",) | ("cancelled", template, values)
+        # | ("result", ok, template, values, version)
         self.job_state: dict[str, tuple] = {}
-        self.jobs: queue.Queue[str] = queue.Queue()
+        self.jobs: queue.Queue[tuple[str, CancelToken]] = queue.Queue()
         self.cancels: dict[str, CancelToken] = {}   # uid -> token of a queued or running update
+        self.taken: set[str] = set()                # uids the worker has picked up; the rest are still queued
+        self.queue_lock = threading.Lock()          # makes "cancel a queued job" and "worker picks it up" exclusive
         self.bulk_jobs: set[str] = set()            # uids queued by "Update all"
         self.scanning = False
         self.last_scan: datetime | None = None
@@ -134,11 +143,14 @@ class MainWindow(QMainWindow):
         self.settings_btn.clicked.connect(self.open_settings)
         self.scan_btn = QPushButton()
         self.scan_btn.clicked.connect(self.start_scan)
+        self.cancel_all_btn = QPushButton()
+        self.cancel_all_btn.setEnabled(False)
+        self.cancel_all_btn.clicked.connect(self.cancel_all_jobs)
         self.all_btn = QPushButton()
         self.all_btn.setObjectName("primary")
         self.all_btn.setEnabled(False)
         self.all_btn.clicked.connect(self.update_all)
-        for b in (self.settings_btn, self.scan_btn, self.all_btn):
+        for b in (self.settings_btn, self.scan_btn, self.cancel_all_btn, self.all_btn):
             b.setCursor(Qt.PointingHandCursor)
             head.addWidget(b, 0, Qt.AlignBottom)
         v.addLayout(head)
@@ -235,6 +247,7 @@ class MainWindow(QMainWindow):
         """Re-apply every visible string; used at start and when the language changes."""
         self.settings_btn.setText(tr("Settings"))
         self.scan_btn.setText(tr("Check again"))
+        self.cancel_all_btn.setText(tr("Cancel all"))
         self.search.setPlaceholderText(tr("Search apps"))
         self.log_btn.setText(tr("Hide log") if self.log_view.isVisible() else tr("Show log"))
         if self.scanning:
@@ -340,6 +353,7 @@ class MainWindow(QMainWindow):
     def _add_row(self, tab: str, s: AppStatus, skipped: bool, ignored: bool):
         row = AppRow(s, skipped, ignored)
         row.update_clicked.connect(self.request_update)
+        row.cancel_clicked.connect(self.cancel_job)
         row.menu_action.connect(self.on_menu)
         item = QListWidgetItem()
         item.setData(Qt.UserRole, s.uid)
@@ -385,6 +399,7 @@ class MainWindow(QMainWindow):
             label = tr(text)
             self.tab_buttons[key].setText(f"{label}  {num(count)}" if count else label)
         pending = self._pending_updates()
+        self.cancel_all_btn.setEnabled(bool(self.active_jobs))
         self.all_btn.setEnabled(bool(pending) and not self.scanning)
         self.all_btn.setText(tr("Update all ({n})", n=num(len(pending))) if pending else tr("Update all"))
 
@@ -458,11 +473,11 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl(upd.page_url))
             return
         self.active_jobs.add(uid)
-        self.cancels[uid] = CancelToken()
+        token = self.cancels[uid] = CancelToken()
         if bulk:
             self.bulk_jobs.add(uid)
         self._set_state(uid, ("queued",))
-        self.jobs.put(uid)
+        self.jobs.put((uid, token))
         self._update_counts()
 
     def update_all(self):
@@ -473,55 +488,99 @@ class MainWindow(QMainWindow):
             self.request_update(uid, bulk=True)
 
     def cancel_job(self, uid: str):
-        """Stop a queued update, or ask the running one to stop."""
+        """Take a queued update out of the queue, or tell the running one to stop."""
         token = self.cancels.get(uid)
-        if token is not None:
+        if token is None or token.is_set:
+            return
+        with self.queue_lock:
             token.cancel()
+            queued = uid not in self.taken
+        s = self.statuses.get(uid)
+        log.info("Cancelling %s (%s)", s.app.name if s else uid, "queued" if queued else "running")
+        if queued:
+            # The worker may be busy with another app for a long time; the row must not wait for it.
+            # When it reaches this entry it sees the cancelled token and skips it.
+            self._on_job_finished(uid, False, N_("Cancelled."), {}, "")
+        else:
+            self._set_state(uid, ("cancelling",))
 
     def cancel_all_jobs(self):
-        for token in list(self.cancels.values()):
-            token.cancel()
+        for uid in list(self.cancels):
+            self.cancel_job(uid)
 
     def _job_loop(self):
         while True:
-            uid = self.jobs.get()
+            uid, token = self.jobs.get()
+            with self.queue_lock:
+                if token.is_set:
+                    continue  # cancelled while queued; cancel_job already updated the row
+                self.taken.add(uid)
             status = self.statuses.get(uid)
             if status is None or status.update is None:
                 self.bus.job_finished.emit(uid, False, "No update pending anymore", {}, "")
                 continue
             name = status.app.name
-            token = self.cancels.get(uid) or CancelToken()
-            if token.is_set:
-                self.bus.job_finished.emit(uid, False, "Cancelled.", {}, "")
-                continue
             ctx = UpdateContext(self.settings, token, partial(self._ask_from_worker, token), uid in self.bulk_jobs)
             log.info("Updating %s from %s (%s)", name, status.update.source, status.update.origin)
-            try:
-                ok, template, values, version = self.updater.run(
-                    status, lambda t, pct, **v: self.bus.job_progress.emit(uid, t, v, pct), ctx)
-            except Exception as e:
-                log.exception("update failed")
-                ok, template, values, version = False, "{error}", {"error": str(e)}, ""
+            ok, template, values, version = self._run_update(uid, status, token, ctx)
             log.info("%s: %s", name, english(template, values))
             self.bus.job_finished.emit(uid, ok, template, values, version or "")
+
+    def _run_update(self, uid: str, status: AppStatus, token: CancelToken, ctx: UpdateContext) -> tuple:
+        """Run one update on its own thread. Once the user cancels, the update gets WIND_DOWN seconds to
+        notice; if it is still busy (winget cannot be interrupted) the queue moves on and it finishes in the
+        background, silently."""
+        result: list[tuple] = []
+
+        def progress(template: str, pct: int, **values):
+            if not token.is_set:
+                self.bus.job_progress.emit(uid, template, values, pct)
+
+        def work():
+            try:
+                result.append(self.updater.run(status, progress, ctx))
+            except Exception as e:
+                log.exception("update failed")
+                result.append((False, "{error}", {"error": str(e)}, ""))
+
+        worker = threading.Thread(target=work, daemon=True)
+        worker.start()
+        give_up = None
+        while worker.is_alive():
+            worker.join(0.1)
+            if token.is_set:
+                give_up = give_up or time.monotonic() + WIND_DOWN
+                if time.monotonic() >= give_up:
+                    break
+        if result:
+            return result[0]
+        return False, N_("Stopped waiting for the installer. It may still be running."), {}, status.app.version
 
     def _set_state(self, uid: str, state: tuple):
         self.job_state[uid] = state
         for row in self.rows.get(uid, []):
             self._show_state(row, state)
 
-    @staticmethod
-    def _show_state(row: AppRow, state: tuple):
+    def _show_state(self, row: AppRow, state: tuple):
         if state[0] == "queued":
             row.set_queued()
         elif state[0] == "progress":
             _, template, values, pct = state
-            row.set_progress(render(template, values), pct)
+            # Only updates can be cancelled; a recheck of one row shows the same bar but has nothing to stop.
+            cancel = "" if row.uid not in self.cancels else "wait" if template in INSTALL_PHASES else "cancel"
+            row.set_progress(render(template, values), pct, cancel)
+        elif state[0] == "cancelling":
+            row.set_cancelling()
+        elif state[0] == "cancelled":
+            row.set_cancelled(render(state[1], state[2]))
         else:
             _, ok, template, values, version = state
             row.set_result(ok, render(template, values), version)
 
     def _on_job_progress(self, uid: str, template: str, values: dict, pct: int):
+        token = self.cancels.get(uid)
+        if token is None or token.is_set:
+            return  # finished, or being cancelled: a late message must not bring the bar back
         self._set_state(uid, ("progress", template, values, pct))
 
     def _ask_from_worker(self, token: CancelToken, question: Question) -> bool:
@@ -549,15 +608,18 @@ class MainWindow(QMainWindow):
 
     def _on_job_finished(self, uid: str, ok: bool, template: str, values: dict, version: str):
         self.active_jobs.discard(uid)
-        self.cancels.pop(uid, None)
+        token = self.cancels.pop(uid, None)
         self.bulk_jobs.discard(uid)
+        with self.queue_lock:
+            self.taken.discard(uid)
         s = self.statuses.get(uid)
+        cancelled = not ok and token is not None and token.is_set
         if ok and s:
             s.app.version = version or s.app.version
             s.update, s.fallbacks = None, []
-        self._set_state(uid, ("result", ok, template, values, version))
+        self._set_state(uid, ("cancelled", template, values) if cancelled else ("result", ok, template, values, version))
         self._update_counts()
-        if not self.active_jobs:
+        if not self.active_jobs and not cancelled:
             QApplication.alert(self)
 
     # -- row menu ------------------------------------------------------
@@ -656,4 +718,5 @@ class MainWindow(QMainWindow):
             if box.clickedButton() is not leave:
                 event.ignore()
                 return
+            self.cancel_all_jobs()
         event.accept()

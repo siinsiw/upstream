@@ -1,15 +1,70 @@
-"""Settings: language, theme (live preview cards) and source options."""
+"""Settings: language, theme (live preview cards), source options and install safety.
+
+Every control applies at once: it writes the settings store and saves, like the checkboxes always did."""
 from __future__ import annotations
 
+import logging
+from urllib.parse import urlsplit
+
 from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
-    QAbstractButton, QButtonGroup, QCheckBox, QComboBox, QDialog, QGridLayout, QHBoxLayout, QLabel,
-    QPushButton, QVBoxLayout,
+    QAbstractButton, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
+    QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
-from ..i18n import LANGUAGES, tr
-from .theme import THEME_ORDER, THEMES, current
+from ..i18n import LANGUAGES, N_, tr, trn
+from .theme import THEME_ORDER, THEMES, current, repolish
+
+log = logging.getLogger("upstream.ui.settings")
+
+# (settings key, title, one-line explanation, [(stored value, label)]): the first value is the default
+POLICIES = (
+    ("publisher_policy", N_("Publisher check"),
+     N_("When an update is signed by someone other than the app's usual publisher."),
+     (("ask", N_("Ask me")), ("block", N_("Block the update")), ("off", N_("Don't check")))),
+    ("close_apps_policy", N_("Running apps"),
+     N_("When an app is open while it is being updated."),
+     (("ask", N_("Ask me")), ("auto", N_("Close it automatically")), ("never", N_("Skip the update")))),
+    ("metered_policy", N_("Metered connection"),
+     N_("When Windows marks your connection as metered (limited data)."),
+     (("ask", N_("Ask me")), ("skip", N_("Skip the update")), ("ignore", N_("Update anyway")))),
+    ("battery_policy", N_("Battery"),
+     N_("When your PC is running low on battery."),
+     (("ask", N_("Ask me")), ("skip", N_("Skip the update")), ("ignore", N_("Update anyway")))),
+)
+PROXY_MODES = (("system", N_("Use Windows settings")), ("none", N_("No proxy")), ("custom", N_("Custom address")))
+PROXY_EXAMPLE = "http://proxy.example.com:8080"
+TIMEOUT_MINUTES = (0, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240)   # 0: wait for ever
+DEFAULT_TIMEOUT = 30
+CONTROL_WIDTH = 230
+
+
+def proxy_address(text: str) -> str | None:
+    """'host:port' or an http(s) URL, optionally with user:pass@, as a full URL; None if it cannot be a proxy."""
+    text = text.strip()
+    if not text or any(ch.isspace() for ch in text):
+        return None
+    if "://" not in text:
+        text = "http://" + text
+    try:
+        parts = urlsplit(text)
+        parts.port
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.path.strip("/") or parts.query or parts.fragment:
+        return None
+    return text.rstrip("/")
+
+
+def _timeout_minutes(value) -> int:
+    """The stored limit as whole minutes; a hand-edited value that makes no sense becomes the default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return DEFAULT_TIMEOUT
+    try:
+        return max(0, int(value))
+    except (ValueError, OverflowError):
+        return DEFAULT_TIMEOUT
 
 
 def _draw_preview(p: QPainter, area: QRectF, t: dict):
@@ -90,6 +145,55 @@ class ThemeCard(QAbstractButton):
         p.end()
 
 
+class _Rule(QFrame):
+    """A one-pixel rule in the current theme's line colour."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(1)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(current()["line"]))
+        p.end()
+
+
+class _Combo(QComboBox):
+    """The wheel scrolls the page and never changes a value on its way past (these are safety settings)."""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
+class _Setting:
+    """A title, a one-line explanation and the control they describe."""
+
+    def __init__(self, title: str, hint: str, control: QWidget):
+        self.title_text, self.hint_text, self.control = title, hint, control
+        self.title = QLabel()
+        self.title.setStyleSheet("font-weight: 600;")
+        self.title.setBuddy(control)
+        self.hint = QLabel()
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+        control.setFixedWidth(CONTROL_WIDTH)
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        text.addWidget(self.title)
+        text.addWidget(self.hint)
+        self.layout = QHBoxLayout()
+        self.layout.setContentsMargins(0, 4, 0, 4)
+        self.layout.setSpacing(20)
+        self.layout.addLayout(text, 1)
+        self.layout.addWidget(control, 0, Qt.AlignVCenter)
+
+    def retranslate(self):
+        self.title.setText(tr(self.title_text))
+        self.hint.setText(tr(self.hint_text))
+        self.control.setAccessibleName(tr(self.title_text))
+        self.control.setAccessibleDescription(tr(self.hint_text))
+
+
 class SettingsDialog(QDialog):
     language_changed = Signal(str)
     theme_changed = Signal(str)
@@ -98,15 +202,18 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.sources_dirty = False
+        self._save_error = ""
+        self._note = ("", "")   # the proxy note: (template, tone)
         self.setMinimumWidth(640)
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(26, 22, 26, 20)
+        content = QWidget()
+        lay = QVBoxLayout(content)
+        lay.setContentsMargins(26, 22, 26, 10)
         lay.setSpacing(10)
 
         self.lang_title = QLabel()
         self.lang_title.setObjectName("section")
-        self.lang = QComboBox()
+        self.lang = _Combo()
         for code, name in LANGUAGES.items():
             self.lang.addItem(name, code)
         self.lang.setCurrentIndex(max(0, self.lang.findData(settings.get("language", "en"))))
@@ -149,8 +256,74 @@ class SettingsDialog(QDialog):
         self.src_hint.setObjectName("hint")
         for w in (self.use_gh, self.pre, self.src_hint):
             lay.addWidget(w)
+        lay.addSpacing(10)
 
-        lay.addSpacing(8)
+        self.safety_title = QLabel()
+        self.safety_title.setObjectName("section")
+        lay.addWidget(self.safety_title)
+        self.rows: list[_Setting] = []
+        self.policy: dict[str, QComboBox] = {}
+        for key, title, hint, options in POLICIES:
+            combo = self.policy[key] = _Combo()
+            for stored, _label in options:
+                combo.addItem("", stored)
+            combo.setCurrentIndex(max(0, combo.findData(settings.get(key, options[0][0]))))
+            combo.currentIndexChanged.connect(lambda _=0, k=key, c=combo: self._store(k, c.currentData()))
+            self._add_row(lay, _Setting(title, hint, combo))
+
+        proxy = settings.get("proxy", {})
+        proxy = proxy if isinstance(proxy, dict) else {}
+        self.proxy_mode = _Combo()
+        for mode, _label in PROXY_MODES:
+            self.proxy_mode.addItem("", mode)
+        self.proxy_mode.setCurrentIndex(max(0, self.proxy_mode.findData(proxy.get("mode"))))
+        self._add_row(lay, _Setting(N_("Network proxy"), N_("Used for update checks and downloads."), self.proxy_mode))
+        self.proxy_label = QLabel()
+        self.proxy_label.setProperty("tone", "muted")
+        self.proxy_url = QLineEdit(str(proxy.get("url") or ""))
+        self.proxy_url.setPlaceholderText(PROXY_EXAMPLE)
+        self.proxy_url.setLayoutDirection(Qt.LeftToRight)
+        self.proxy_url.setStyleSheet("QLineEdit:disabled { background: transparent; }")   # reads as off in every theme
+        self.proxy_label.setBuddy(self.proxy_url)
+        url_row = QHBoxLayout()
+        url_row.setSpacing(12)
+        url_row.addWidget(self.proxy_label)
+        url_row.addWidget(self.proxy_url, 1)
+        lay.addLayout(url_row)
+        self.proxy_note = QLabel()
+        self.proxy_note.setWordWrap(True)
+        self.proxy_note.hide()
+        lay.addWidget(self.proxy_note)
+        self._on_proxy_mode(store=False)
+        self.proxy_mode.currentIndexChanged.connect(lambda _=0: self._on_proxy_mode())
+        self.proxy_url.editingFinished.connect(self._commit_proxy)
+
+        saved_minutes = _timeout_minutes(settings.get("install_timeout_min", DEFAULT_TIMEOUT))
+        self.timeout = _Combo()
+        for minutes in sorted({*TIMEOUT_MINUTES, saved_minutes}):
+            self.timeout.addItem("", minutes)
+        self.timeout.setCurrentIndex(self.timeout.findData(saved_minutes))
+        self.timeout.currentIndexChanged.connect(lambda _=0: self._store("install_timeout_min", self.timeout.currentData()))
+        self._add_row(lay, _Setting(
+            N_("Installer time limit"),
+            N_("How long to wait for one installer. After that Upstream moves on; the installer is not stopped."),
+            self.timeout))
+
+        self.safety_hint = QLabel()
+        self.safety_hint.setObjectName("hint")
+        lay.addWidget(self.safety_hint)
+        lay.addStretch(1)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(content)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self.save_error = QLabel()
+        self.save_error.setProperty("tone", "danger")
+        self.save_error.setWordWrap(True)
+        self.save_error.hide()
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         self.done_btn = QPushButton()
@@ -158,8 +331,33 @@ class SettingsDialog(QDialog):
         self.done_btn.setDefault(True)
         self.done_btn.clicked.connect(self.accept)
         buttons.addWidget(self.done_btn)
-        lay.addLayout(buttons)
+        self.bar = QWidget()
+        bar = QVBoxLayout(self.bar)
+        bar.setContentsMargins(26, 12, 26, 18)
+        bar.addWidget(self.save_error)
+        bar.addLayout(buttons)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self.scroll, 1)
+        outer.addWidget(_Rule())   # shows that the settings continue when they scroll
+        outer.addWidget(self.bar)
         self.retranslate()
+        self._fit(content)
+
+    def _add_row(self, lay: QVBoxLayout, row: _Setting):
+        self.rows.append(row)
+        lay.addLayout(row.layout)
+
+    def _fit(self, content: QWidget):
+        """Tall enough for everything when the screen allows it; on a small screen the settings scroll."""
+        width = max(self.minimumWidth(), self.sizeHint().width())
+        content.layout().activate()   # height-for-width is unknown until the layout has been set up
+        wanted = content.layout().totalHeightForWidth(width) + self.bar.sizeHint().height() + 1
+        screen = (self.parentWidget() or self).screen() or QGuiApplication.primaryScreen()
+        room = int(screen.availableGeometry().height() * 0.92) if screen else wanted
+        self.resize(width, min(wanted, room))
 
     def retranslate(self):
         self.setWindowTitle(tr("Settings"))
@@ -169,6 +367,22 @@ class SettingsDialog(QDialog):
         self.use_gh.setText(tr("Use the GitHub CLI (gh) token when signed in"))
         self.pre.setText(tr("Offer pre-releases (beta, rc)"))
         self.src_hint.setText(tr("Source changes apply on the next check."))
+        self.safety_title.setText(tr("Install safety"))
+        self.safety_hint.setText(tr("These apply from the next update."))
+        for row in self.rows:
+            row.retranslate()
+        for key, _title, _hint, options in POLICIES:
+            for i, (_stored, label) in enumerate(options):
+                self.policy[key].setItemText(i, tr(label))
+        for i, (_mode, label) in enumerate(PROXY_MODES):
+            self.proxy_mode.setItemText(i, tr(label))
+        for i in range(self.timeout.count()):
+            minutes = self.timeout.itemData(i)
+            self.timeout.setItemText(i, trn("{n} minute", "{n} minutes", minutes) if minutes else tr("No time limit"))
+        self.proxy_label.setText(tr("Proxy address"))
+        self.proxy_url.setAccessibleName(tr("Proxy address"))
+        self._show_note(*self._note)
+        self._show_save_error(self._save_error)
         self.done_btn.setText(tr("Done"))
         for card in self.cards:
             card.setAccessibleName(card.label())
@@ -184,6 +398,69 @@ class SettingsDialog(QDialog):
             card.update()
 
     def _set_source(self, key: str, value: bool):
-        self.settings.set(key, value)
-        self.settings.save()
+        self._store(key, value)
         self.sources_dirty = True
+
+    def _store(self, key: str, value):
+        self.settings.set(key, value)
+        try:
+            self.settings.save()
+        except OSError as e:
+            log.warning("Could not save the settings: %s", e)
+            self._show_save_error(str(e))
+        else:
+            self._show_save_error("")
+
+    def _show_save_error(self, error: str):
+        self._save_error = error
+        self.save_error.setText(tr("Couldn't save the settings: {error}", error=error) if error else "")
+        self.save_error.setVisible(bool(error))
+
+    # -- proxy ---------------------------------------------------------
+    def _on_proxy_mode(self, store: bool = True):
+        mode = self.proxy_mode.currentData()
+        self.proxy_label.setEnabled(mode == "custom")
+        self.proxy_url.setEnabled(mode == "custom")
+        if mode == "custom":
+            if store:
+                self._commit_proxy()
+            else:
+                self._checked_proxy()
+        else:
+            self._show_note("", "")
+            if store:
+                self._store("proxy", {"mode": mode, "url": self.proxy_url.text().strip()})
+
+    def _checked_proxy(self) -> str | None:
+        """The typed address as a full URL, or None with a note saying what is missing."""
+        text = self.proxy_url.text().strip()
+        url = proxy_address(text)
+        if url is None:
+            self._show_note(N_("Enter the proxy as http://host:port. The previous setting stays in use until then."),
+                            "danger" if text else "muted")
+        else:
+            self._show_note("", "")
+        return url
+
+    def _commit_proxy(self):
+        """Saves a custom proxy once its address is usable; until then the earlier setting stays in force."""
+        if self.proxy_mode.currentData() != "custom":
+            return
+        url = self._checked_proxy()
+        if url is None:
+            return
+        self.proxy_url.setText(url)
+        value = {"mode": "custom", "url": url}
+        if self.settings.get("proxy") != value:
+            self._store("proxy", value)
+
+    def _show_note(self, template: str, tone: str):
+        self._note = (template, tone)
+        self.proxy_note.setText(tr(template) if template else "")
+        self.proxy_note.setProperty("tone", tone)
+        repolish(self.proxy_note)
+        self.proxy_note.setVisible(bool(template))
+
+    def done(self, result: int):
+        self._commit_proxy()
+        super().done(result)

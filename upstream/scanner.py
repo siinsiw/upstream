@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from . import site, winget
-from .github import GitHub, RateLimited, discover_token, machine_arch, repo_from_urls
+from .github import GitHub, RateLimited, discover_token, machine_arch
 from .i18n import render, tr
 from .inventory import InstalledApp, read_installed_apps
 from .versioning import is_newer
@@ -147,7 +147,8 @@ class Scanner:
 
     def _refresh_meta(self, statuses, progress, force=False):
         ids = sorted({s.winget_id for s in statuses if s.winget_id})
-        stale = [i for i in ids if force or time.time() - self._meta(i).get("ts", 0) > META_TTL]
+        stale = [i for i in ids if force or time.time() - self._meta(i).get("ts", 0) > META_TTL
+                 or self._meta(i).get("v") != winget.META_VERSION]
         if not stale:
             return
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -164,7 +165,9 @@ class Scanner:
         app = s.app
         override = self.settings.override(app.ident)
         meta = self._meta(s.winget_id)
-        s.repo = override.get("github") or repo_from_urls(app.urls) or meta.get("repo")
+        # A repo the user typed always wins; otherwise the links on the app and in its winget manifest are scored.
+        s.repo = override.get("github") or self.github.discover(
+            app, [*app.urls, *meta.get("urls", [])], s.winget_id, self.arch)
         s.update, s.fallbacks = None, []
         s.set_note("")
         chain: list[Update] = []
@@ -180,6 +183,9 @@ class Scanner:
                                         notes=res.release.notes, installer_type=res.installer_type))
                 elif res.latest and is_newer(res.latest, app.version):
                     s.set_note("GitHub has {version}, but no Windows installer", version=res.latest)
+                elif res.incomparable:
+                    s.set_note("GitHub's version {version} can't be compared with the installed one",
+                               version=res.incomparable)
             except RateLimited:
                 s.set_note("GitHub rate limit reached; using winget")
             except Exception as e:

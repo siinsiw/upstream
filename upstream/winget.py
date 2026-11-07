@@ -1,6 +1,6 @@
 """winget as the 'official site' channel: its manifests point at each vendor's
 own installer URLs and pin their SHA-256, so winget downloads from the vendor
-and verifies the file. Also used to learn which GitHub repo an app ships from."""
+and verifies the file. Its manifests also list the GitHub links the scanner scores to find an app's repo."""
 from __future__ import annotations
 
 import logging
@@ -9,13 +9,18 @@ import shutil
 import subprocess
 import unicodedata
 from dataclasses import dataclass
+from functools import lru_cache
 
-from .github import repo_from_urls
+from .inventory import make_ident
+from .versioning import compare
 
 log = logging.getLogger("upstream.winget")
 
 CREATE_NO_WINDOW = 0x08000000
+META_VERSION = 2   # the shape of what show() returns; the scanner re-reads older cache entries
 _URL = re.compile(r"https?://[^\s\"'<>]+")
+_ARP_ID = re.compile(r"^ARP\\(Machine|User)\\(?:X64|X86|ARM64)\\(.+)$", re.I)
+_ARCH_TAG = re.compile(r"(?<![a-z0-9])(x64|x86|arm64|amd64|64-bit|32-bit)(?![a-z0-9])", re.I)
 _SIZE = re.compile(r"([\d.]+)\s*(KB|MB|GB)\s*/\s*([\d.]+)\s*(KB|MB|GB)", re.I)
 _PERCENT = re.compile(r"(\d{1,3})\s*%")
 _UNITS = {"KB": 1, "MB": 1024, "GB": 1024 * 1024}
@@ -93,19 +98,74 @@ def list_installed() -> list[WingetRow]:
     return rows
 
 
-def match_rows(apps, rows: list[WingetRow]) -> dict[str, WingetRow]:
-    """reg_key -> winget row. winget prints the Apps & Features display name,
-    truncated with '…' when it is long."""
-    by_key: dict[str, WingetRow] = {}
-    for row in rows:
-        name = row.name.lower()
-        truncated = name.endswith("…")
+_ident = lru_cache(maxsize=4096)(make_ident)
+
+
+@lru_cache(maxsize=4096)
+def _fold(text: str) -> str:
+    return " ".join(text.casefold().split())
+
+
+def _arch_tag(text: str) -> str | None:
+    m = _ARCH_TAG.search(text)
+    return {"amd64": "x64", "64-bit": "x64", "32-bit": "x86"}.get(m.group(1).lower(), m.group(1).lower()) if m else None
+
+
+def _pair_score(app, row: WingetRow) -> int:
+    """How surely this winget row is this installed entry; 0 when it cannot be."""
+    arp = _ARP_ID.match(row.id)
+    if arp:   # ARP\Machine\X64\{product code} names the registry entry itself
+        same = arp.group(1).lower() == app.scope and arp.group(2).lower() == app.reg_key.rsplit("\\", 1)[-1].lower()
+        return 1000 if same else 0
+    name, target = _fold(row.name), _fold(app.name)
+    if name.endswith("…"):   # winget cuts long display names to the column width
         prefix = name.rstrip("…").strip()
-        hits = [a for a in apps if (a.name.lower().startswith(prefix) if truncated else a.name.lower() == name)]
-        if len(hits) > 1:
-            hits = [a for a in hits if a.version == row.version] or hits[:1]
-        for app in hits:
-            by_key.setdefault(app.reg_key, row)
+        if not prefix or not target.startswith(prefix):
+            return 0
+        score = 50
+    elif name == target:
+        score = 60
+    elif _ident(name) and _ident(name) == _ident(target):
+        score = 40
+    else:
+        return 0
+    row_arch, app_arch = _arch_tag(row.name) or _arch_tag(row.id), _arch_tag(app.name)
+    if row_arch and app_arch and row_arch != app_arch:
+        return 0   # the x86 and x64 redistributables share a name prefix
+    if row_arch and not app_arch:
+        score += 10 if row_arch == app.arch else -30
+    if row.version:
+        if row.version == app.version:
+            score += 30
+        elif compare(row.version, app.version) == 0:
+            score += 25
+        elif row.version in app.name:   # Visual C++ redistributables carry their version in the name
+            score += 15
+        elif compare(row.version, app.version) is not None:
+            score -= 5
+    id_words = set(re.findall(r"[a-z0-9]{3,}", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", row.id).lower()))
+    shared = id_words & set(re.findall(r"[a-z0-9]{3,}", f"{app.name} {app.publisher}".lower()))
+    return max(score + 3 * min(3, len(shared)), 0)
+
+
+def match_rows(apps, rows: list[WingetRow]) -> dict[str, WingetRow]:
+    """reg_key -> winget row. winget prints the Apps & Features display name, truncated with '…' when it
+    is long, so a row is compared with every app by name, architecture, version and package id. The closest
+    pairs are settled first and a row or an app is never used twice: two entries with the same name (.NET
+    runtimes, a per-user and a per-machine copy) each get their own row, and the machine-wide copy wins
+    a single row."""
+    pairs = []
+    for app in apps:
+        for index, row in enumerate(rows):
+            score = _pair_score(app, row)
+            if score > 0:
+                pairs.append((-score, app.scope != "machine", app.reg_key, index))
+    by_key: dict[str, WingetRow] = {}
+    used: set[int] = set()
+    for _, _, reg_key, index in sorted(pairs):
+        if reg_key not in by_key and index not in used:
+            by_key[reg_key] = rows[index]
+            used.add(index)
     return by_key
 
 
@@ -113,14 +173,19 @@ def show(pkg_id: str) -> dict:
     """Manifest facts for one package. Labels are localised, so URLs are
     classified by key text when it is English and by shape otherwise."""
     lines = _run(["show", "--id", pkg_id, "--exact", "--source", "winget"], timeout=120)
-    meta = {"repo": None, "installer_url": None, "installer_type": None, "homepage": None, "version": None}
-    other_urls = []
+    meta = {"v": META_VERSION, "urls": [], "installer_url": None, "installer_type": None,
+            "homepage": None, "version": None}
     for line in lines:
         key, sep, value = line.strip().partition(":")
         if not sep:
             continue
         key, value = key.strip().lower(), value.strip()
         url = _URL.search(value)
+        # Every GitHub link on the page, whatever its label says: the scanner scores them against the app.
+        for found in _URL.findall(line):
+            found = found.rstrip(".,;)")
+            if "github.com/" in found.lower() and found not in meta["urls"] and len(meta["urls"]) < 12:
+                meta["urls"].append(found)
         if meta["version"] is None and re.fullmatch(r"\d[\w.\-+]*", value):
             meta["version"] = value
         if url:
@@ -129,12 +194,8 @@ def show(pkg_id: str) -> dict:
                 meta["installer_url"] = meta["installer_url"] or u
             elif key == "homepage":
                 meta["homepage"] = u
-            elif key in ("publisher url", "release notes url"):
-                other_urls.append(u)
         elif key == "installer type":
             meta["installer_type"] = value.lower()
-    repo_sources = [meta["installer_url"], meta["homepage"], *other_urls]
-    meta["repo"] = repo_from_urls(u for u in repo_sources if u)
     return meta
 
 
