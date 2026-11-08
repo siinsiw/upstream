@@ -170,6 +170,7 @@ class SearchTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[:2], ["search", "visual studio code"])
         self.assertEqual(args[args.index("--count") + 1], str(discover.MAX_ROWS))
+        self.assertGreaterEqual(discover.MAX_ROWS, 300)
 
     def test_limit_and_duplicates(self):
         lines = render_table(["Name", "Id", "Version"],
@@ -223,6 +224,53 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "winget isn't installed on this PC.")
 
 
+class LocaleSiblingTests(unittest.TestCase):
+    """`winget search firefox` lists matches in id order: the languages (Mozilla.Firefox.<locale>) come before ESR,
+    Beta, Developer Edition and Nightly, and 100 rows were all languages."""
+    CODES = [a + b for a in "abcdefghij" for b in "klmnopqrst"]            # a hundred language codes
+
+    def firefox_rows(self, plain=True):
+        rows = [["Mozilla Firefox (en-US)", "Mozilla.Firefox", "159.0"]] if plain else []
+        rows += [[f"Mozilla Firefox ({code})", f"Mozilla.Firefox.{code}", "159.0"] for code in self.CODES]
+        rows += [[f"Mozilla Firefox ESR ({code})", f"Mozilla.Firefox.ESR.{code}", "140.5"] for code in self.CODES[:40]]
+        rows += [["Mozilla Firefox ESR", "Mozilla.Firefox.ESR", "140.5"], ["Firefox Beta", "Mozilla.Firefox.Beta", "160.0b1"],
+                 ["Firefox Developer Edition", "Mozilla.Firefox.DeveloperEdition", "160.0b1"],
+                 ["Firefox Nightly", "Mozilla.Firefox.Nightly", "161.0a1"]]
+        return rows
+
+    def search(self, rows, limit=30):
+        lines = render_table(["Name", "Id", "Version"], rows)
+        with mock.patch.object(discover, "_run", return_value=(0, lines)):
+            return search("firefox", limit)
+
+    def test_the_channels_are_found_and_the_languages_are_not_results(self):
+        ids = [p.id for p in self.search(self.firefox_rows())]
+        self.assertEqual(ids[0], "Mozilla.Firefox")
+        self.assertEqual(set(ids), {"Mozilla.Firefox", "Mozilla.Firefox.ESR", "Mozilla.Firefox.Beta",
+                                    "Mozilla.Firefox.DeveloperEdition", "Mozilla.Firefox.Nightly"})
+
+    def test_a_family_with_no_plain_package_keeps_its_first_language(self):
+        ids = [p.id for p in self.search(self.firefox_rows(plain=False))]
+        self.assertEqual(ids.count(f"Mozilla.Firefox.{self.CODES[0]}"), 1)
+        self.assertEqual(len([i for i in ids if i.startswith("Mozilla.Firefox.") and i[16:].islower()]), 1)
+        self.assertEqual(len([i for i in ids if i.startswith("Mozilla.Firefox.ESR")]), 1)
+        self.assertIn("Mozilla.Firefox.Nightly", ids)
+
+    def test_the_plain_package_wins_even_when_a_language_is_listed_first(self):
+        rows = [["Mozilla Firefox (de)", "Mozilla.Firefox.de", "159.0"], ["Mozilla Firefox (en-US)", "Mozilla.Firefox", "159.0"]]
+        self.assertEqual([r[1] for r in discover._collapse_locales(rows)], ["Mozilla.Firefox"])
+
+    def test_a_package_whose_name_ends_in_something_else_in_brackets_is_not_a_language(self):
+        rows = [["Mozilla Firefox (MSIX)", "Mozilla.Firefox.MSIX", "159.0"], ["Mozilla Firefox (de)", "Mozilla.Firefox.de", "1"],
+                ["Mozilla Firefox (ach)", "Mozilla.Firefox.ach", "1"], ["Other Tool (de)", "Other.Tool", "1"]]
+        self.assertEqual([r[1] for r in discover._collapse_locales(rows)],
+                         ["Mozilla.Firefox.MSIX", "Mozilla.Firefox.de", "Other.Tool"])
+
+    def test_distinct_apps_with_the_same_name_in_other_publishers_stay(self):
+        rows = [["Notes (de)", "Alpha.Notes.de", "1"], ["Notes (de)", "Beta.Notes.de", "1"]]
+        self.assertEqual(len(discover._collapse_locales(rows)), 2)
+
+
 class FakeProc:
     """A winget process that answers after `after` seconds, or never."""
 
@@ -258,9 +306,9 @@ class RunTests(unittest.TestCase):
         self.assertEqual(args[:3], ["winget", "search", "firefox"])
         self.assertTrue({"--source", "winget", "--accept-source-agreements", "--disable-interactivity"} <= set(args))
         self.assertFalse({"install", "upgrade", "uninstall", "import"} & set(args))
-        # the exact name and the other Firefox first, the per-language package after the tag matches
+        # the exact name and the other Firefox first; the Achi edition is a language of the first row, not a result
         self.assertEqual([p.id for p in found], ["Mozilla.Firefox", "Mozilla.Firefox.MSIX", "Ablaze.Floorp",
-                                                 "EclipseCommunity.r3dfox", "Mozilla.Flowstate", "Mozilla.Firefox.ach"])
+                                                 "EclipseCommunity.r3dfox", "Mozilla.Flowstate"])
         self.assertEqual(found[2].version, "")      # "12.20.…" was cut by winget
 
     def test_exit_code_is_read_unsigned(self):

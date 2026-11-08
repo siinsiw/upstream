@@ -18,9 +18,9 @@ from unittest import mock
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QTimer                                             # noqa: E402
-from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QWidget         # noqa: E402
+from PySide6.QtWidgets import QApplication, QDialog, QSystemTrayIcon, QWidget  # noqa: E402
 
-from upstream import background, i18n                                           # noqa: E402
+from upstream import background, i18n, net                                      # noqa: E402
 from upstream.background import Background                                     # noqa: E402
 from upstream.inventory import InstalledApp                                     # noqa: E402
 from upstream.running import RunningProcess                                     # noqa: E402
@@ -76,6 +76,7 @@ class FakeWindow(QWidget):
         self.update_alls = 0
         self.requests: list[tuple] = []
         self.fail_requests: set[str] = set()
+        self.reject: set[str] = set()       # request_update answers False: the queue would not take it now
 
     def add(self, status: AppStatus) -> AppStatus:
         self.statuses[status.uid] = status
@@ -107,6 +108,7 @@ class FakeWindow(QWidget):
         if uid in self.fail_requests:
             raise RuntimeError("queue is broken")
         self.requests.append((uid, bulk, auto))
+        return uid not in self.reject
 
     def isActiveWindow(self):
         return self.active
@@ -128,11 +130,12 @@ class FakeTray:
 
 
 def make_status(name: str, version: str = "2.0", *, update: bool = True, pin=None, source: str = "github",
-                download_url: str | None = "https://example.invalid/setup.exe", fallbacks=None) -> AppStatus:
-    installed = InstalledApp(reg_key=f"HKCU\\{name}", name=name, version="1.0", publisher="Pub", scope="user",
+                download_url: str | None = "https://example.invalid/setup.exe", fallbacks=None,
+                scope: str = "user", repo: str | None = None, note: str = "") -> AppStatus:
+    installed = InstalledApp(reg_key=f"HKCU\\{name}", name=name, version="1.0", publisher="Pub", scope=scope,
                              arch="x64")
     upd = Update(source, version, "owner/repo", download_url=download_url) if update else None
-    return AppStatus(installed, update=upd, pin=pin, fallbacks=fallbacks or [])
+    return AppStatus(installed, update=upd, pin=pin, fallbacks=fallbacks or [], repo=repo, note=note)
 
 
 def pump():
@@ -243,6 +246,53 @@ class ScheduleTest(BackgroundCase):
         self.advance(60)
         self.assertEqual(self.window.scans, 1)
 
+    def test_a_dialog_that_is_open_postpones_the_check(self):
+        # The dialog's own event loop keeps the timer firing, and a scan that finishes under it replaces the statuses
+        # the dialog is working on.
+        dialog = QDialog()
+        dialog.setModal(True)
+        dialog.show()
+        self.addCleanup(dialog.deleteLater)
+        pump()
+        self.assertIs(QApplication.activeModalWidget(), dialog)
+        self.bg.start()
+        self.advance(10 * 60)
+        self.assertEqual(self.window.scans, 0)
+        self.assertEqual(self.bg._skip_reason(self.clock.now), "a dialog is open")
+        dialog.close()
+        pump()
+        self.advance(60)
+        self.assertEqual(self.window.scans, 1)
+
+    def test_a_clock_set_back_does_not_freeze_the_start_up_grace(self):
+        self.bg.start()
+        self.advance(60)
+        self.clock.now -= HOUR                        # the user (or the time service) put the clock back
+        self.bg._tick()
+        self.advance(background.STARTUP_GRACE + 60)
+        self.assertEqual(self.window.scans, 1)
+
+    def test_a_clock_set_back_does_not_freeze_the_retry_wait(self):
+        self.bg.start()
+        self.advance(3 * 60)
+        self.assertEqual(self.window.scans, 1)        # an attempt that never finishes
+        self.clock.now -= HOUR
+        self.bg._tick()
+        self.advance(background.RETRY_AFTER + 120)
+        self.assertEqual(self.window.scans, 2)
+
+    def test_a_clock_set_back_does_not_extend_the_wake_up_pause(self):
+        self.settings.data["last_check_ts"] = self.clock.now
+        self.bg.start()
+        self.advance(5 * 60)
+        self.clock.now += 7 * HOUR                    # the PC slept: a check is due, after a short pause
+        self.bg._tick()
+        self.assertEqual(self.window.scans, 0)
+        self.clock.now -= HOUR                        # and woke up to a clock that was an hour ahead
+        self.bg._tick()
+        self.advance(background.RESUME_DELAY + 120)
+        self.assertEqual(self.window.scans, 1)
+
     def test_stamp_from_the_future_counts_as_never(self):
         self.settings.data["last_check_ts"] = self.clock.now + 30 * 24 * HOUR
         self.bg.start()
@@ -278,6 +328,65 @@ class ScheduleTest(BackgroundCase):
         self.assertTrue(self.bg.timer.isActive())
         self.bg.stop()
         self.assertFalse(self.bg.timer.isActive())
+
+
+class GithubUnreachableTest(BackgroundCase):
+    """A check that mostly could not reach GitHub (Wi-Fi not up yet after a start at login) is not "done"."""
+
+    def add(self, count: int, failed: int, note: str = "GitHub was unreachable"):
+        for i in range(count):
+            self.window.add(make_status(f"App{i}", update=False, repo=f"o/app{i}", note=note if i < failed else ""))
+
+    def test_most_apps_blind_means_no_stamp_and_a_retry_after_the_usual_wait(self):
+        self.add(4, 2)                                 # exactly half
+        self.bg.start()
+        self.advance(3 * 60)
+        self.assertEqual(self.window.scans, 1)
+        with self.assertLogs("upstream.background", "INFO"):
+            self.bg.scan_finished()
+        self.assertNotIn("last_check_ts", self.settings.data)
+        self.advance(background.RETRY_AFTER - 300)
+        self.assertEqual(self.window.scans, 1)
+        self.advance(600)
+        self.assertEqual(self.window.scans, 2)
+
+    def test_the_rate_limit_note_counts_too(self):
+        self.add(3, 3, "GitHub rate limit reached; using winget")
+        self.bg.scan_finished()
+        self.assertNotIn("last_check_ts", self.settings.data)
+
+    def test_fewer_than_half_blind_is_a_finished_check(self):
+        self.add(4, 1)
+        self.bg.scan_finished()
+        self.assertEqual(self.settings.data["last_check_ts"], self.clock.now)
+
+    def test_apps_without_a_repository_do_not_count(self):
+        self.window.add(make_status("Plain", update=False, note="GitHub was unreachable"))     # no repo
+        self.bg.scan_finished()
+        self.assertEqual(self.settings.data["last_check_ts"], self.clock.now)
+
+    def test_a_scan_with_no_apps_at_all_is_a_finished_check(self):
+        self.bg.scan_finished()
+        self.assertEqual(self.settings.data["last_check_ts"], self.clock.now)
+
+    def test_blind_checks_in_a_row_stop_counting_so_a_dead_repository_cannot_loop(self):
+        self.add(2, 2)
+        for _ in range(background.MAX_BLIND_SCANS - 1):
+            self.bg.scan_finished()
+            self.assertNotIn("last_check_ts", self.settings.data)
+        self.bg.scan_finished()
+        self.assertEqual(self.settings.data["last_check_ts"], self.clock.now)
+
+    def test_a_good_check_starts_the_count_again(self):
+        self.add(2, 2)
+        self.bg.scan_finished()
+        self.bg.scan_finished()
+        self.window.statuses.clear()
+        self.bg.scan_finished()                        # reached GitHub this time
+        self.add(2, 2)
+        self.settings.data.pop("last_check_ts")
+        self.bg.scan_finished()
+        self.assertNotIn("last_check_ts", self.settings.data)
 
 
 class NotificationTest(BackgroundCase):
@@ -483,6 +592,110 @@ class AutoUpdateTest(BackgroundCase):
                 self.bg.scan_finished()
         self.assertEqual(self.window.requests, [])
         self.find.assert_not_called()
+
+    def test_a_pin_set_after_the_scan_still_holds(self):
+        # The status the scan produced has no pin, but the user pinned the app while the scan was running.
+        self.window.add(make_status("Alpha"))
+        self.settings.data["pins"] = {"alpha": {"mode": "hold", "version": "1.0"}}
+        with self.assertLogs("upstream.background", "INFO") as logs:
+            self.bg.scan_finished()
+        self.assertIn("Alpha 2.0 skipped: pinned", "\n".join(logs.output))
+        self.assertEqual(self.window.requests, [])
+
+    def test_a_machine_wide_update_needs_an_elevated_upstream(self):
+        alpha = self.window.add(make_status("Alpha", scope="machine"))
+        user = self.window.add(make_status("Charlie"))
+        with mock.patch.object(background.elevation, "is_elevated", return_value=False):
+            with self.assertLogs("upstream.background", "INFO") as logs:
+                self.bg.scan_finished()
+        self.assertIn("Alpha 2.0 skipped: needs administrator rights", "\n".join(logs.output))
+        self.assertEqual(self.window.requests, [(user.uid, True, True)])
+        self.assertEqual(self.tray.messages, [("1 update ready", "Alpha 2.0 is ready to install")])
+        with mock.patch.object(background.elevation, "is_elevated", return_value=True):
+            self.bg.scan_finished()
+        self.assertIn((alpha.uid, True, True), self.window.requests)
+
+    def test_a_store_or_per_user_update_never_needs_the_prompt(self):
+        self.window.add(make_status("Charlie"))
+        with mock.patch.object(background.elevation, "is_elevated", return_value=False):
+            self.bg.scan_finished()
+        self.assertEqual(len(self.window.requests), 1)
+
+    def test_a_request_the_queue_refused_is_not_tried_for_good(self):
+        alpha = self.window.add(make_status("Alpha"))
+        self.window.reject = {alpha.uid}                         # an uninstall is running
+        self.bg.scan_finished()
+        self.assertEqual(self.window.requests, [(alpha.uid, True, True)])
+        self.assertEqual(self.settings.data.get("auto_tried", []), [])
+        self.assertEqual(self.tray.messages, [("1 update ready", "Alpha 2.0 is ready to install")])   # not silent
+        self.window.reject = set()
+        self.bg.scan_finished()
+        self.assertEqual(len(self.window.requests), 2)                                                 # tried again
+        self.assertEqual(self.settings.data["auto_tried"], ["alpha@2.0"])
+
+    def test_a_request_that_raised_is_not_tried_for_good_either(self):
+        alpha = self.window.add(make_status("Alpha"))
+        self.window.fail_requests = {alpha.uid}
+        with self.assertLogs("upstream.background", "ERROR"):
+            self.bg.scan_finished()
+        self.assertEqual(self.settings.data.get("auto_tried", []), [])
+
+    def test_only_the_accepted_updates_are_remembered(self):
+        alpha = self.window.add(make_status("Alpha"))
+        echo = self.window.add(make_status("Echo"))
+        self.window.reject = {alpha.uid}
+        self.bg.scan_finished()
+        self.assertEqual(self.settings.data["auto_tried"], ["echo@2.0"])
+        self.assertIn(echo.uid, self.bg._auto_keys)
+
+    def test_a_metered_or_battery_refusal_gives_the_version_another_chance(self):
+        refusals = [net.REFUSED_METERED, net.REFUSED_BATTERY, net.REFUSED_BATTERY_SAVER]
+        self.assertEqual(set(refusals), set(net.PREFLIGHT_REFUSALS))
+        for template in refusals:
+            with self.subTest(template):
+                self.settings.data["auto_tried"] = []
+                self.window.requests.clear()
+                alpha = self.window.add(make_status("Alpha"))
+                self.bg.scan_finished()
+                self.assertEqual(self.settings.data["auto_tried"], ["alpha@2.0"])
+                self.bg.auto_finished(alpha.uid, False, template)
+                self.assertEqual(self.settings.data["auto_tried"], [])
+                self.bg.scan_finished()
+                self.assertEqual(len(self.window.requests), 2)
+
+    def test_any_other_end_keeps_the_version_tried(self):
+        for ok, template in [(True, "Installed {version}"), (False, "Install failed"),
+                             (False, "Update cancelled: {name} is still running."), (False, ""), (False, None),
+                             (False, "Not updated: the battery is at 5%")]:
+            with self.subTest(ok=ok, template=template):
+                self.settings.data["auto_tried"] = []
+                self.window.requests.clear()
+                alpha = self.window.add(make_status("Alpha"))
+                self.bg.scan_finished()
+                self.bg.auto_finished(alpha.uid, ok, template)
+                self.assertEqual(self.settings.data["auto_tried"], ["alpha@2.0"])
+                self.bg.scan_finished()
+                self.assertEqual(len(self.window.requests), 1)
+
+    def test_auto_finished_ignores_uids_it_did_not_queue(self):
+        alpha = self.window.add(make_status("Alpha"))
+        bravo = self.window.add(make_status("Bravo"))               # not in auto_update: the user's own update
+        self.bg.scan_finished()
+        before = dict(self.settings.data)
+        self.bg.auto_finished(bravo.uid, False, net.REFUSED_METERED)
+        self.bg.auto_finished("HKCU\\Nobody", False, net.REFUSED_METERED)
+        self.bg.auto_finished("", True, "")
+        self.assertEqual(self.settings.data, before)
+        self.bg.auto_finished(alpha.uid, False, net.REFUSED_METERED)
+        self.bg.auto_finished(alpha.uid, False, net.REFUSED_METERED)         # a second call does nothing more
+        self.assertEqual(self.settings.data["auto_tried"], [])
+
+    def test_a_refusal_only_removes_its_own_version(self):
+        alpha = self.window.add(make_status("Alpha"))
+        self.settings.data["auto_tried"] = ["other@1.0"]
+        self.bg.scan_finished()
+        self.bg.auto_finished(alpha.uid, False, net.REFUSED_METERED)
+        self.assertEqual(self.settings.data["auto_tried"], ["other@1.0"])
 
     def test_never_asks_for_a_non_automatic_request(self):
         self.window.add(make_status("Alpha"))

@@ -30,7 +30,7 @@ FA: dict[str, str] = {
     "Latest version": "آخرین نسخه",
     "Source": "منبع",
     "{label} — {origin}": "{label} — {origin}",
-    "Links": "پیوندها",
+    "Links": "لینک‌ها",
     "Uninstall command": "دستور حذف",
     "No uninstall command is registered with Windows.": "دستور حذفی برای این برنامه در ویندوز ثبت نشده است.",
     "Copy": "کپی",
@@ -41,8 +41,8 @@ FA: dict[str, str] = {
     "Modify": "تغییر",
     "Repair {name}": "تعمیر {name}",
     "Windows Installer will reinstall all the files and registry entries of {name}. Settings kept outside the app's folder are not touched. Windows may ask for permission.":
-        "برنامهٔ Windows Installer همهٔ فایل‌ها و مقدارهای رجیستری {name} را دوباره نصب می‌کند. "
-        "تنظیماتی که بیرون از پوشهٔ برنامه نگهداری می‌شوند دست نمی‌خورند. ممکن است ویندوز اجازه بخواهد.",
+        "برنامهٔ Windows Installer همهٔ فایل‌ها، کلیدها و مقدارهای رجیستری {name} را دوباره نصب می‌کند. تنظیماتی "
+        "که بیرون از پوشهٔ برنامه نگهداری می‌شوند دست نمی‌خورند. ممکن است ویندوز اجازه بخواهد.",
     "Upstream stops waiting for Windows Installer. The repair itself is not stopped.":
         "انتظار برای Windows Installer متوقف می‌شود، ولی خودِ تعمیر متوقف نمی‌شود.",
     "Updates are running right now. Wait until they finish, then try again.":
@@ -57,10 +57,10 @@ FA: dict[str, str] = {
     "Opened the Modify window of {name}. Follow the steps there.": "پنجرهٔ تغییر {name} باز شد. مراحل را همان‌جا ادامه بده.",
     "{name} doesn't offer a Modify option.": "{name} گزینهٔ تغییر ندارد.",
     "Upstream won't run the Modify command of {name}: its program is missing or not safe to start.":
-        "اجرای دستور تغییر {name} ممکن نیست: برنامهٔ آن پیدا نشد یا اجرایش مطمئن نیست.",
+        "برنامهٔ Upstream دستور تغییر {name} را اجرا نمی‌کند: برنامهٔ آن پیدا نشد یا اجرایش ایمن نیست.",
     "Only apps installed with Windows Installer (MSI) can be repaired from here.":
         "فقط برنامه‌هایی که با Windows Installer (MSI) نصب شده‌اند از اینجا تعمیر می‌شوند.",
-    "The installer of {name} says it can't be repaired.": "نصب‌کنندهٔ {name} اعلام کرده که تعمیر ندارد.",
+    "The installer of {name} says it can't be repaired.": "نصب‌کنندهٔ {name} اعلام کرده که قابل تعمیر نیست.",
     "Windows Installer no longer knows {name}, so it can't be repaired.":
         "برنامهٔ Windows Installer دیگر {name} را نمی‌شناسد، برای همین تعمیر نمی‌شود.",
 }

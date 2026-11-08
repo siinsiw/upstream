@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import uuid
 from pathlib import Path
@@ -734,6 +735,57 @@ class CrashDialogTest(TempData):
         self.assertIn("could not be read", d.view.placeholderText())
         self.assertFalse(d.copy_btn.isEnabled())
         self.assertTrue(d.open_btn.isEnabled())
+
+
+class ExitNowTest(TempData):
+    """A normal interpreter shutdown can abort the process when a daemon thread is still inside Qt."""
+
+    @staticmethod
+    def _fake_ole(calls, fail=None):
+        def flush():
+            calls.append(("clipboard",))
+            if fail is not None:
+                raise fail
+            return 0
+        return mock.patch.object(stability.ctypes, "windll", types.SimpleNamespace(ole32=types.SimpleNamespace(OleFlushClipboard=flush)), create=True)
+
+    def test_it_leaves_without_finalisation_after_closing_what_it_must(self):
+        calls = []
+        with mock.patch.object(stability.os, "_exit", lambda code: calls.append(("exit", code))),                 mock.patch.object(stability, "_close_fault_file", lambda: calls.append(("fault",))),                 mock.patch.object(stability.logging, "shutdown", lambda: calls.append(("log",))),                 self._fake_ole(calls):
+            stability.exit_now(3)
+        self.assertEqual(calls, [("fault",), ("log",), ("clipboard",), ("exit", 3)])
+
+    def test_the_clipboard_is_flushed_before_the_process_ends(self):
+        # Qt renders copied text lazily and only in its own teardown, which os._exit skips: without the flush the
+        # crash report, the details or the uninstall command the user just copied is gone after quit.
+        calls = []
+        with mock.patch.object(stability.os, "_exit", lambda code: calls.append(("exit", code))),                 mock.patch.object(stability, "_close_fault_file"), mock.patch.object(stability.logging, "shutdown"),                 self._fake_ole(calls):
+            stability.exit_now(0)
+        self.assertLess(calls.index(("clipboard",)), calls.index(("exit", 0)))
+
+    def test_a_failing_clipboard_flush_still_exits(self):
+        for error in (OSError("no clipboard"), AttributeError("no ole32")):
+            with self.subTest(error=type(error).__name__):
+                calls = []
+                with mock.patch.object(stability.os, "_exit", lambda code: calls.append(code)),                         mock.patch.object(stability, "_close_fault_file"), mock.patch.object(stability.logging, "shutdown"),                         self._fake_ole([], fail=error):
+                    stability.exit_now(5)
+                self.assertEqual(calls, [5])
+
+    def test_a_failing_flush_still_exits(self):
+        calls = []
+
+        class Broken:
+            def flush(self):
+                raise ValueError("closed")
+
+        with mock.patch.object(stability.os, "_exit", lambda code: calls.append(code)),                 mock.patch.object(stability, "_close_fault_file"), mock.patch.object(stability.logging, "shutdown"),                 mock.patch.object(stability.sys, "stdout", Broken()), self._fake_ole([]):
+            stability.exit_now(0)
+        self.assertEqual(calls, [0])
+
+    def test_the_real_entry_point_uses_it(self):
+        text = (Path(stability.__file__).resolve().parent.parent / "main.py").read_text("utf-8")
+        self.assertIn("stability.exit_now(main())", text)
+        self.assertNotIn("sys.exit(main())", text)
 
 
 if __name__ == "__main__":

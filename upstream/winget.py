@@ -3,18 +3,25 @@ own installer URLs and pin their SHA-256, so winget downloads from the vendor
 and verifies the file. Its manifests also list the GitHub links the scanner scores to find an app's repo."""
 from __future__ import annotations
 
+import http.client
 import logging
 import os
 import queue
 import re
 import shutil
+import ssl
 import subprocess
 import threading
+import time
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from functools import lru_cache
 
-from .errors import Cancelled
+from . import net
+from .errors import Cancelled, StoppedWaiting
 from .inventory import make_ident
 from .versioning import compare
 
@@ -22,6 +29,8 @@ log = logging.getLogger("upstream.winget")
 
 CREATE_NO_WINDOW = 0x08000000
 META_VERSION = 2   # the shape of what show() returns; the scanner re-reads older cache entries
+SIZE_TIMEOUT = 4.0       # seconds one size request may take
+MIN_INSTALLER_BYTES = 8 * 1024   # a "download" smaller than this is an error page, not an installer
 _URL = re.compile(r"https?://[^\s\"'<>]+")
 _ARP_ID = re.compile(r"^ARP\\(Machine|User)\\(?:X64|X86|ARM64)\\(.+)$", re.I)
 _ARCH_TAG = re.compile(r"(?<![a-z0-9])(x64|x86|arm64|amd64|64-bit|32-bit)(?![a-z0-9])", re.I)
@@ -205,6 +214,47 @@ def show(pkg_id: str) -> dict:
     return meta
 
 
+def _announced_size(resp) -> int:
+    """What a response says the whole file weighs: Content-Range for a 206 (the answer to a one-byte request),
+    Content-Length otherwise. 0 when it says nothing usable, or the body is a web page rather than an installer."""
+    if resp.headers.get("Content-Type", "").lower().startswith("text/"):
+        return 0
+    if resp.status == 206:
+        m = re.fullmatch(r"\s*bytes\s+\d+-\d+/(\d+)\s*", resp.headers.get("Content-Range") or "")
+        size = int(m.group(1)) if m else 0
+    else:
+        length = (resp.headers.get("Content-Length") or "").strip()
+        size = int(length) if length.isdigit() else 0
+    return size if size >= MIN_INSTALLER_BYTES else 0
+
+
+def remote_size(url: str, timeout: float = SIZE_TIMEOUT) -> int:
+    """How many bytes downloading `url` transfers, asked without downloading it: a HEAD request, then, for a server
+    that refuses HEAD or leaves the length out, a GET for the first byte (its Content-Range holds the total).
+    0 when the server doesn't say. A network failure (no connection, timeout) raises OSError so the caller can tell
+    an unreachable network from a server that keeps its sizes to itself. A URL that is neither https nor loopback is
+    not asked at all (0), the same rule net.download applies: a plain-http answer could be swapped on the way."""
+    if not net.is_secure(url):
+        return 0
+    for method, extra in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
+        try:
+            req = urllib.request.Request(url, method=method, headers={
+                "User-Agent": net.USER_AGENT, "Accept-Encoding": "identity", **extra})
+            with net.urlopen(req, timeout=timeout) as resp:
+                size = _announced_size(resp)
+        except urllib.error.HTTPError:
+            continue    # 403, 405, 501: the server won't answer this way; the next request may
+        except urllib.error.URLError as e:
+            if isinstance(e, net.RedirectRefused) or isinstance(e.reason, ssl.SSLError):
+                return 0    # a server that answered badly is not a missing network
+            raise
+        except (ssl.SSLError, ValueError, http.client.HTTPException):
+            return 0
+        if size:
+            return size
+    return 0
+
+
 def parse_versions(lines: list[str]) -> list[str]:
     """The one-column table `winget show --versions` prints: a header, a dashed line, then a version per line.
     The header is localised, the dashes are not. Anything else (package not found) gives an empty list."""
@@ -266,7 +316,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_install=None,
-           version: str | None = None) -> tuple[int, str]:
+           version: str | None = None, timeout_min: float | None = None) -> tuple[int, str]:
     """Run `winget upgrade` (or `install` for a package winget did not match to
     this machine, or `install --version` for mode 'rollback', which needs `version`; see _update_args)
     and stream its progress. Returns (exit code, last message).
@@ -274,12 +324,18 @@ def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_inst
     `cancel` (a context.CancelToken) ends the run. While winget only prepares and downloads it is terminated with
     everything it started and Cancelled("Cancelled.") is raised. Once the install has begun it is left running
     (stopping an installer half way can leave the app broken): Cancelled says that Upstream stopped waiting.
+    `timeout_min` (install_timeout_min; None or 0 = no limit) ends the wait the same way, so an unattended run cannot
+    hang the queue: StoppedWaiting while installing, a terminated winget before that. Its clock starts when winget
+    does, and starts again whenever the download advances and when the install begins: it measures how long winget
+    has been stuck, not how long a big download takes.
     `on_progress(percent)` reports the download only; the moment the install begins `on_install()` is called
     once and `on_progress` falls silent. The install is recognised by what winget prints, whatever the language:
     a completed download, a percentage bar (the installer's own), any text after the download started, or
     the English "Starting package install"."""
     if cancel is not None:
         cancel.check()
+    limit = timeout_min * 60 if timeout_min and timeout_min > 0 else None
+    deadline = time.monotonic() + limit if limit else None
     args = _update_args(pkg_id, mode, version)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             creationflags=CREATE_NO_WINDOW)
@@ -301,21 +357,35 @@ def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_inst
     last = ""
     buf = b""
     downloading = installing = False
+    fetched = -1.0
+
+    def renew():
+        nonlocal deadline
+        if limit:
+            deadline = time.monotonic() + limit
 
     def begin_install():
         nonlocal installing
         if not installing:
             installing = True
+            renew()
             if on_install:
                 on_install()
 
     while True:
-        if cancel is not None and cancel.is_set and proc.poll() is None:
+        stopped = cancel is not None and cancel.is_set
+        if (stopped or (deadline is not None and time.monotonic() >= deadline)) and proc.poll() is None:
             if not installing:
                 _kill_tree(proc)
-                raise Cancelled("Cancelled.")
+                if stopped:
+                    raise Cancelled("Cancelled.")
+                raise Cancelled("winget was still preparing the download after {minutes} minutes, so Upstream "
+                                "stopped it. Nothing was installed.", minutes=f"{timeout_min:g}")
             abandoned.set()
-            raise Cancelled("Stopped waiting for the installer. It may still be running.")
+            if stopped:
+                raise Cancelled("Stopped waiting for the installer. It may still be running.")
+            raise StoppedWaiting("The installer was still running after {minutes} minutes, so Upstream stopped "
+                                 "waiting for it. It may still be running.", minutes=f"{timeout_min:g}")
         try:
             chunk = chunks.get(timeout=0.1)
         except queue.Empty:
@@ -336,6 +406,9 @@ def update(pkg_id: str, mode: str, on_progress, on_line, *, cancel=None, on_inst
                 total = float(size.group(3)) * _UNITS[size.group(4).upper()]
                 if not installing:
                     downloading = True
+                    if done > fetched:
+                        fetched = done
+                        renew()
                     on_progress(int(done * 100 / total) if total else -1)
                     if total and done >= total:
                         begin_install()

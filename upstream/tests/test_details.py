@@ -17,6 +17,7 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import shiboken6                                                          # noqa: E402
 from PySide6.QtCore import QEvent                                         # noqa: E402
 from PySide6.QtGui import QGuiApplication, QPalette                       # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit        # noqa: E402
@@ -549,6 +550,42 @@ class ModifyTest(TempTree):
 
 # --- the dialog --------------------------------------------------------------------------
 
+class DeletedBeforeTheTimerTest(unittest.TestCase):
+    """The first-paint timer is bound to the dialog: a dialog that is deleted before it fires starts nothing."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        patches = [mock.patch.object(theme, "DATA_DIR", Path(self._tmp.name)),
+                   mock.patch.object(inventory, "_msi_state", return_value=5),
+                   mock.patch.object(details, "installer_family", return_value="msi"),
+                   mock.patch.object(details, "signer_of", return_value=("Valid", "Filmju Ltd"))]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(app.setStyleSheet, "")
+        self.thread = mock.patch.object(ui.threading, "Thread")
+        self.starts = self.thread.start()
+        self.addCleanup(self.thread.stop)
+
+    def dialog(self) -> ui.DetailsDialog:
+        return ui.DetailsDialog(AppStatus(make_app(size_kb=10698, install_date="20250628")))
+
+    def test_a_dialog_that_stays_starts_its_work_after_the_first_event_loop_turn(self):
+        dialog = self.dialog()
+        self.addCleanup(dialog.close)
+        self.starts.assert_not_called()
+        app.processEvents()
+        self.assertEqual(self.starts.call_count, 1)
+
+    def test_a_dialog_deleted_first_starts_no_thread(self):
+        dialog = self.dialog()
+        shiboken6.delete(dialog)
+        app.processEvents()
+        app.processEvents()
+        self.starts.assert_not_called()
+
+
 class DialogTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -621,7 +658,7 @@ class DialogTest(unittest.TestCase):
 
     def test_the_background_work_is_scheduled_after_the_first_paint(self):
         dialog = self.make()
-        self.timer.assert_called_once_with(0, dialog.start_background)
+        self.timer.assert_called_once_with(0, dialog, dialog.start_background)
 
     def test_the_background_work_starts_once(self):
         dialog = self.make()

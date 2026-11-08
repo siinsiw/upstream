@@ -394,15 +394,20 @@ def _names(procs: list[RunningProcess]) -> str:
 def close_for_update(ctx, app: InstalledApp, progress) -> None:
     """Ask / close the app's processes if any are running. `ctx` is a context.UpdateContext.
     Raises errors.Cancelled when the user declines or the update was cancelled; a cancelled update never closes
-    anything. `progress(template, percent, **values)`."""
+    anything. An unattended update (ctx.auto) never closes anything either: it is cancelled when the app is running.
+    `progress(template, percent, **values)`."""
     ctx.cancel.check()
     policy = ctx.setting("close_apps_policy", "ask")
-    if policy == "never":
+    if policy == "never" and not ctx.auto:
         return
     procs = find_running(app)
     if not procs:
         return
     log.info("%s is running: %s", app.name, _names(procs))
+    if ctx.auto:
+        # Nobody is watching: closing the user's open app could lose their work (whatever close_apps_policy says),
+        # and installing over it would fail or leave files half replaced. The next check tries again.
+        raise Cancelled("Update cancelled: {name} is still running.", name=app.name)
     if policy != "auto" and not ctx.ask(
             "{name} is running. Close it to update?", yes="Close it", no="Cancel update",
             detail="These will be closed: {processes}. Unsaved changes in them may be lost.",

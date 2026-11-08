@@ -21,8 +21,10 @@ log = logging.getLogger("upstream.discover")
 NO_WINGET = N_("winget isn't installed on this PC.")
 FLAGS = ["--source", "winget", "--accept-source-agreements", "--disable-interactivity"]
 TIMEOUT = 90                # seconds; the first search after a long while also refreshes winget's catalogue
-MAX_ROWS = 100              # asked of winget. It lists matches in id order, not by relevance, and sizes the columns from
-                            # about the first 100 rows, cutting longer cells in later ones with "…": more rows lose ids
+MAX_ROWS = 300              # asked of winget. It lists matches in id order, not by relevance, so a popular name fills the
+                            # first 100 rows with its per-language packages (Mozilla.Firefox.<locale>) before ESR, Beta
+                            # or Nightly come up. Winget sizes its columns from about the first 100 rows and cuts longer
+                            # cells in later ones with "…"; those rows are left out (see search), the rest are kept
 NO_MATCH = 0x8A150014       # NO_APPLICATIONS_FOUND, what `winget search` exits with when nothing matches
 _ELLIPSIS = "…"
 _VALID_ID = re.compile(r"\S+\.\S+|\S+…")   # Publisher.Package, or one cut short
@@ -138,6 +140,29 @@ def _tier(row: tuple[str, str, str], query: str) -> int:
     return 3 if all(word in text for word in q.split()) else 4
 
 
+def _family(row: tuple[str, str, str]) -> tuple[tuple[str, str], bool]:
+    """(family, is a language edition) of a result. "Mozilla Firefox (de)" with id Mozilla.Firefox.de is the German
+    edition of the package whose id is the same without the language. A name ending in a language code whose id
+    does not end in that code ("Mozilla Firefox (en-US)" = Mozilla.Firefox) is the plain package itself."""
+    name, pid, _ = row
+    suffix = _LOCALE_SUFFIX.search(name)
+    head, _, last = pid.rpartition(".")
+    edition = bool(suffix and head and last.casefold() == suffix.group(0).strip()[1:-1].casefold())
+    return ((head if edition else pid).casefold(), _LOCALE_SUFFIX.sub("", name).casefold()), edition
+
+
+def _collapse_locales(rows: list[tuple[str, str, str]]) -> list[tuple[str, str, str]]:
+    """One row per package family: the plain package, or the first language edition when the plain one is not
+    listed. Without this the 90 or so languages of a browser use up the whole list."""
+    best: dict[tuple[str, str], tuple[int, bool]] = {}
+    for index, row in enumerate(rows):
+        family, edition = _family(row)
+        if family not in best or (best[family][1] and not edition):
+            best[family] = (index, edition)
+    keep = {index for index, _ in best.values()}
+    return [row for index, row in enumerate(rows) if index in keep]
+
+
 def _rank(rows: list[tuple[str, str, str]], query: str) -> list[tuple[str, str, str]]:
     """De-duplicated by id and ordered by _tier; winget's own order decides between equals. A catalogue
     often holds a package per language ("Mozilla Firefox (de)", ...): after the first of a family
@@ -173,7 +198,7 @@ def search(query: str, limit: int = 30, cancel=None) -> list[Package]:
             raise SearchError(N_("winget couldn't search: {error}"), error=last)
         return []
     found: dict[str, Package] = {}
-    for name, pid, version in _rank(rows, query):
+    for name, pid, version in _rank(_collapse_locales(rows), query):
         if pid.endswith(_ELLIPSIS):
             log.info("left out %s: winget cut its id short", pid)      # it could not be installed
         else:

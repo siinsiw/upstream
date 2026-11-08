@@ -6,6 +6,7 @@ import json
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -25,8 +26,11 @@ class TempSnapshot(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         self.dir = Path(folder.name)
         self.file = self.dir / "sub" / "last_scan.json"
+        self.registry: list = []        # what the one re-read of the registry at load time lists
+        self.reads = mock.Mock(side_effect=lambda hidden=None: list(self.registry))
         for patch in (mock.patch.object(scanner, "SNAPSHOT_FILE", self.file),
-                      mock.patch.object(scanner, "still_listed", return_value=True)):
+                      mock.patch.object(scanner, "still_listed", return_value=True),
+                      mock.patch.object(scanner, "read_installed_apps", self.reads)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -62,9 +66,9 @@ def sample_statuses() -> list[AppStatus]:
 class RoundTripTest(TempSnapshot):
     def test_everything_a_row_needs_comes_back(self):
         statuses = sample_statuses()
-        self.assertTrue(save_snapshot(statuses, taken=1_800_000_000.5))
+        self.assertTrue(save_snapshot(statuses, taken=1_700_000_000.5))
         loaded = load_snapshot()
-        self.assertEqual(loaded, (statuses, 1_800_000_000.5))
+        self.assertEqual(loaded, (statuses, 1_700_000_000.5))
         plain = loaded[0][0]
         self.assertEqual(plain.fallbacks[0].source, "winget")
         self.assertEqual(plain.uid, statuses[0].uid)
@@ -159,9 +163,81 @@ class GoneAppsTest(TempSnapshot):
             self.assertEqual(load_snapshot()[0], [])
 
 
+class UpdatedSinceTest(TempSnapshot):
+    """A row restored from the snapshot must not show a version, and an offer, that the PC no longer has."""
+
+    def setUp(self):
+        super().setUp()
+        self.statuses = sample_statuses()
+        save_snapshot(self.statuses, taken=1_700_000_000.0)
+        self.plain, self.held = self.statuses[0], self.statuses[1]
+        self.assertIsNotNone(self.plain.update)
+
+    def newer(self, status, version):
+        return make_app(status.app.name, version, reg_key=status.app.reg_key, install_location=r"C:\Moved")
+
+    def load(self):
+        return {s.app.name: s for s in load_snapshot()[0]}
+
+    def test_an_app_updated_by_hand_since_takes_the_registry_version_and_loses_its_offer(self):
+        self.registry = [self.newer(self.plain, "4.0.0"), self.held.app]
+        rows = self.load()
+        demo = rows["Demo"]
+        self.assertEqual((demo.app.version, demo.app.install_location), ("4.0.0", r"C:\Moved"))
+        self.assertIsNone(demo.update)
+        self.assertEqual((demo.fallbacks, demo.badges), ([], []))
+        self.assertEqual((demo.repo, demo.winget_id), ("o/demo", "Demo.App"))       # the rest is the snapshot's
+
+    def test_rows_whose_version_is_unchanged_keep_everything(self):
+        self.registry = [self.plain.app, self.held.app]
+        rows = self.load()
+        self.assertEqual(rows["Demo"], self.plain)
+        self.assertEqual(rows["Held"], self.held)
+
+    def test_the_registry_is_read_once_however_many_rows_there_are(self):
+        self.registry = [self.newer(self.plain, "4.0.0")]
+        self.load()
+        self.assertEqual(self.reads.call_count, 1)
+
+    def test_a_row_the_registry_read_does_not_list_is_kept_as_it_was(self):
+        self.registry = []
+        self.assertEqual(self.load()["Demo"], self.plain)
+
+    def test_store_rows_are_not_looked_up(self):
+        store = next(s for s in self.statuses if s.app.reg_key.startswith("WINGET"))
+        clash = make_app("Terminal", "9.9", reg_key=store.app.reg_key)
+        self.registry = [clash]
+        self.assertEqual(self.load()["Terminal"].app.version, "1.22")
+
+    def test_no_registry_rows_to_check_means_no_read(self):
+        save_snapshot([s for s in self.statuses if s.app.reg_key.startswith("WINGET")], taken=1_700_000_000.0)
+        load_snapshot()
+        self.reads.assert_not_called()
+
+    def test_a_registry_that_cannot_be_read_keeps_the_snapshot_as_it_was(self):
+        self.reads.side_effect = OSError("denied")
+        with self.assertLogs("upstream.scan", "WARNING"):
+            self.assertEqual(self.load()["Demo"], self.plain)
+
+
 class CorruptionTest(TempSnapshot):
     def test_no_snapshot_is_none(self):
         self.assertIsNone(load_snapshot())
+
+    def test_a_scan_time_that_is_not_a_date_or_lies_in_the_future_is_none(self):
+        # 1e11 is the year 5138 and 1e300 no date at all: datetime.fromtimestamp raises on the first and the second.
+        now = time.time()
+        for taken in (1e11, 1e300, 4_102_444_800.0, now + 2 * 86400):
+            with self.subTest(taken=taken):
+                self.write({"schema": 1, "time": taken, "statuses": []})
+                self.assertIsNone(load_snapshot())
+
+    def test_a_scan_time_a_little_ahead_of_this_clock_is_fine(self):
+        taken = time.time() + 3600
+        self.write({"schema": 1, "time": taken, "statuses": []})
+        loaded = load_snapshot()
+        self.assertEqual(loaded, ([], taken))
+        datetime.fromtimestamp(loaded[1])
 
     def test_unreadable_files_are_none(self):
         good = json.dumps({"schema": 1, "time": 5.0, "statuses": []})
@@ -276,7 +352,7 @@ class ScanTest(TempSnapshot):
     def setUp(self):
         super().setUp()
         self.apps = [make_app("Demo", "3.0.0"), make_app("Other", "1.0", reg_key=r"HKLM64\Other")]
-        for patch in (mock.patch.object(scanner, "read_installed_apps", side_effect=lambda hidden: list(self.apps)),
+        for patch in (mock.patch.object(scanner, "read_installed_apps", side_effect=lambda hidden=None: list(self.apps)),
                       mock.patch.object(scanner.winget, "available", return_value=False)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -317,7 +393,7 @@ class BadgeHookTest(TempSnapshot):
         super().setUp()
         self.calls = []
         self.badge = badges.Badge(kind="security", text="Security fix", tooltip="CVE-2026-0001")
-        for patch in (mock.patch.object(scanner, "read_installed_apps", side_effect=lambda hidden: [make_app("Demo", "3.0.0")]),
+        for patch in (mock.patch.object(scanner, "read_installed_apps", side_effect=lambda hidden=None: [make_app("Demo", "3.0.0")]),
                       mock.patch.object(scanner.winget, "available", return_value=False),
                       mock.patch.object(scanner.badges, "refresh_eol", side_effect=self.refresh),
                       mock.patch.object(scanner.badges, "compute", side_effect=self.compute)):

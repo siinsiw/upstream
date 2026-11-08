@@ -443,6 +443,31 @@ class RedirectPolicyTest(unittest.TestCase):
             new, _ = self.follow(source, target)
             self.assertEqual(new.full_url, target)
 
+    def test_a_head_stays_a_head_through_every_kind_of_redirect(self):
+        for code in (301, 302, 303, 307, 308):
+            head = urllib.request.Request("https://a.test/x", method="HEAD")
+            new = net._SafeRedirect().redirect_request(head, io.BytesIO(), code, "Moved", http.client.HTTPMessage(),
+                                                       "https://b.test/y")
+            self.assertEqual((new.get_method(), new.full_url), ("HEAD", "https://b.test/y"), code)
+
+    def test_a_get_stays_a_get(self):
+        new, _ = self.follow("https://a.test/x", "https://b.test/y")
+        self.assertEqual(new.get_method(), "GET")
+
+    def test_the_opener_sends_the_second_request_as_a_head_too(self):
+        seen = []
+
+        class Recorder(FakeHttps):
+            def https_open(self, req):
+                seen.append((req.get_method(), req.full_url))
+                return super().https_open(req)
+
+        opener = net._build_opener("none", "")
+        opener.add_handler(Recorder({"https://a.test/go": (302, "https://b.test/file"), "https://b.test/file": (200, b"")}))
+        with opener.open(urllib.request.Request("https://a.test/go", method="HEAD")):
+            pass
+        self.assertEqual(seen, [("HEAD", "https://a.test/go"), ("HEAD", "https://b.test/file")])
+
     def test_every_opener_is_built_with_it(self):
         for mode in ("system", "none", "custom"):
             opener = net._build_opener(mode, "127.0.0.1:3128")
@@ -642,11 +667,11 @@ class PreflightTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
 
-    def ctx(self, bulk=False, **settings):
+    def ctx(self, bulk=False, auto=False, **settings):
         def ask(question):
             self.questions.append(question)
             return self.answer
-        return UpdateContext(FakeSettings(**settings), CancelToken(), ask, bulk)
+        return UpdateContext(FakeSettings(**settings), CancelToken(), ask, bulk, auto)
 
     def test_nothing_to_report_means_no_question(self):
         net.preflight(self.ctx())
@@ -773,6 +798,40 @@ class PreflightTest(unittest.TestCase):
         with self.assertRaises(Cancelled):
             net.preflight(self.ctx(bulk=True))
         self.assertEqual(len(self.questions), 2)
+
+
+    def test_an_unattended_refusal_is_not_remembered_for_the_users_own_update_all(self):
+        self.metered = True
+        with self.assertRaises(Cancelled):
+            net.preflight(self.ctx(bulk=True, auto=True))      # nobody can answer: an automatic No
+        self.assertEqual(self.questions, [])
+        net.preflight(self.ctx(bulk=True))                      # the user's Update all is asked, not silently refused
+        self.assertEqual(len(self.questions), 1)
+
+    def test_an_unattended_refusal_is_still_a_refusal_and_names_its_reason(self):
+        for state, template in (("metered", net.REFUSED_METERED), ("battery", net.REFUSED_BATTERY),
+                                ("saver", net.REFUSED_BATTERY_SAVER)):
+            with self.subTest(state):
+                self.metered, self.battery, self.saver = state == "metered", None, False
+                if state != "metered":
+                    self.battery, self.saver = (True, 10 if state == "battery" else 80), state == "saver"
+                with self.assertRaises(Cancelled) as caught:
+                    net.preflight(self.ctx(bulk=True, auto=True))
+                self.assertEqual(caught.exception.template, template)
+                self.assertIn(template, net.PREFLIGHT_REFUSALS)
+        self.assertEqual(self.questions, [])
+
+    def test_an_unattended_job_does_not_overwrite_a_yes_the_user_gave(self):
+        self.metered = True
+        net.preflight(self.ctx(bulk=True))                      # the user said yes to the batch
+        net.preflight(self.ctx(bulk=True, auto=True))
+        net.preflight(self.ctx(bulk=True))
+        self.assertEqual(len(self.questions), 1)
+
+    def test_the_refusals_are_translated(self):
+        from upstream.translations import net as net_translations
+        for template in net.PREFLIGHT_REFUSALS:
+            self.assertIn(template, net_translations.FA)
 
 
 class SystemStateTest(unittest.TestCase):

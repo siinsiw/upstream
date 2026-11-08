@@ -27,6 +27,11 @@ What a source's outcome does to the run:
     disk_full            ends the run; no other source has more room
     needs_admin, failed  the next source is tried, and the last error is what the row shows
 
+An unattended run (ctx.auto) never opens a window or waits for an answer: a file with no published SHA-256 needs the
+publisher's valid signature (trust.evaluate), an installer with no silent mode fails this source (next source is
+tried), an app that is running is not closed (running.close_for_update), and winget gets the same time limit as an
+installer (install_timeout_min).
+
 The downloaded installer is deleted when its source ends, whatever the outcome, except after
 errors.StoppedWaiting: Upstream gave up waiting for an installer that may still be running and holding the file.
 
@@ -67,6 +72,14 @@ class Attempt:
     signer: str = ""
     sig_status: str = ""
     approved: bool = False         # the user answered Yes to a publisher warning for this file
+
+
+def _timeout_minutes(ctx: UpdateContext) -> int:
+    """install_timeout_min for this run; 0 means no limit. The installer path reads the same setting in installer.py."""
+    try:
+        return max(0, int(ctx.setting("install_timeout_min", installer.DEFAULT_TIMEOUT_MIN)))
+    except (TypeError, ValueError):
+        return installer.DEFAULT_TIMEOUT_MIN
 
 
 def _discard(path: Path) -> None:
@@ -168,7 +181,8 @@ class Updater:
         if sig_status == "HashMismatch":
             raise installer.InstallError("The file's digital signature is broken (tampered); nothing was installed.")
 
-        decision = trust.evaluate(ctx.settings, app, sig_status, signer)
+        # An unattended install of a file nothing vouches for (no published SHA-256) needs the publisher's signature.
+        decision = trust.evaluate(ctx.settings, app, sig_status, signer, require_baseline=ctx.auto and not upd.sha256)
         if decision.action == "block":
             raise installer.InstallError(decision.template, **decision.values)
         approved = decision.action == "ask"
@@ -179,6 +193,10 @@ class Updater:
 
         kind = installer.detect(path, upd.installer_type)
         log.info("%s: installer type %s", app.name, KIND_LABELS.get(kind, kind))
+        if ctx.auto and kind == "exe":
+            # No silent switch is known, so the setup wizard would open on screen and wait for someone who isn't there.
+            raise installer.InstallError("{name} has an installer with no silent mode, so it can't be updated "
+                                         "unattended. Update it yourself from the list.", name=app.name)
         plan = inplace.plan(app, kind, path)
         for template, values in plan.warnings:
             log.warning("%s: %s", app.name, english(template, values))
@@ -222,6 +240,7 @@ class Updater:
                 cancel=ctx.cancel,
                 on_install=lambda: progress("Installing", -1),
                 version=upd.version if upd.winget_mode == "rollback" else None,
+                timeout_min=_timeout_minutes(ctx),
             )
             return exitcodes.classify_winget(code, last)
 

@@ -148,6 +148,62 @@ class PolicyTest(TrustTestCase):
                     d.detail.format(**d.values)
 
 
+class UnattendedTest(TrustTestCase):
+    """require_baseline: an unattended install of a file with no published SHA-256 needs the publisher's valid
+    signature; nobody is there to look at anything else."""
+
+    def check(self, status, signer, installed="Demo Software Inc", **settings):
+        with mock.patch.object(trust, "_installed_signer", return_value=installed):
+            return trust.evaluate(FakeSettings(**settings), make_app(), status, signer, require_baseline=True)
+
+    def test_a_valid_signature_by_the_known_publisher_passes(self):
+        self.assertEqual(self.check("Valid", "Demo Software, Inc").action, "allow")
+
+    def test_the_remembered_signer_is_a_baseline_too(self):
+        d = self.check("Valid", "Demo Software GmbH", installed="", signers={"demo app": "Demo Software GmbH"})
+        self.assertEqual(d.action, "allow")
+
+    def test_a_signer_the_user_accepted_earlier_passes(self):
+        d = self.check("Valid", "New Owner Ltd", signers_approved={"demo app": ["New Owner Ltd"]})
+        self.assertEqual(d.action, "allow")
+
+    def test_the_registry_publisher_is_enough_of_a_baseline_when_the_signature_is_valid_and_contains_it(self):
+        self.assertEqual(self.check("Valid", "Demo Software Europe GmbH", installed="").action, "allow")
+
+    def test_everything_else_is_blocked_with_a_reason_and_never_asked(self):
+        cases = [("NotSigned", ""), ("Valid", "Mallory Ltd"), ("NotTrusted", "Demo Software Inc"),
+                 ("HashMismatch", "Demo Software Inc"), ("Unknown", ""), ("Valid", "")]
+        for policy in ("ask", "block"):
+            for status, signer in cases:
+                with self.subTest(policy=policy, status=status, signer=signer):
+                    d = self.check(status, signer, publisher_policy=policy)
+                    self.assertEqual(d.action, "block")
+                    self.assertEqual(d.values, {"name": "Demo App"})
+                    self.assertIn("Demo App", InstallError(d.template, **d.values).args[0])
+
+    def test_an_unsigned_open_source_app_with_no_signed_baseline_is_blocked_when_nobody_can_look(self):
+        # The same file passes for a manual install (UnsignedTest); unattended it has nothing to vouch for it.
+        app = make_app(publisher="")
+        with mock.patch.object(trust, "_installed_signer", return_value=""):
+            self.assertEqual(trust.evaluate(FakeSettings(), app, "NotSigned", "").action, "allow")
+            self.assertEqual(trust.evaluate(FakeSettings(), app, "NotSigned", "", require_baseline=True).action, "block")
+            self.assertEqual(trust.evaluate(FakeSettings(), app, "Valid", "Anyone Ltd", require_baseline=True).action,
+                             "block")
+
+    def test_the_publisher_policy_off_still_switches_the_whole_check_off(self):
+        self.assertEqual(self.check("NotSigned", "", publisher_policy="off").action, "allow")
+
+    def test_not_asking_for_it_changes_nothing(self):
+        with mock.patch.object(trust, "_installed_signer", return_value="Demo Software Inc"):
+            self.assertEqual(trust.evaluate(FakeSettings(), make_app(), "NotSigned", "").action, "ask")
+            self.assertEqual(trust.evaluate(FakeSettings(), make_app(), "NotSigned", "", require_baseline=False).action,
+                             "ask")
+
+    def test_the_block_is_logged(self):
+        self.check("NotSigned", "")
+        self.assertTrue(self.log.warning.called)
+
+
 class NoBaselineTest(TrustTestCase):
     """Nothing signed to compare with: unsigned is normal, but a signature Windows rejects is not."""
     BAD = [("NotTrusted", "Mallory Ltd"), ("UnknownError", ""), ("Incompatible", ""), ("HashMismatch", "Mallory Ltd"),

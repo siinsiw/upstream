@@ -519,6 +519,304 @@ class Registry(TempTree):
         undone = cleanup.restore(result.backup_id)
         self.assertEqual((undone.restored, [t for _, t, _ in undone.failed]), (0, [cleanup.R_SERVICE]))
 
+    def test_a_service_windows_does_not_know_loses_its_leftover_key(self):
+        """Error 1060 (no such service) used to count as removed while the key stayed and a restart was promised."""
+        location = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\UpstreamTestSvc"
+        present = [True]
+        deleted = []
+
+        def fake_export(loc, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("Windows Registry Editor Version 5.00", "utf-16")
+
+        def fake_tree_delete(hive, sub, depth=0, gone=None):
+            deleted.append((hive, sub))
+            present[0] = False
+
+        with mock.patch.object(cleanup, "is_admin", lambda: True), mock.patch.object(cleanup, "key_exists", lambda loc: present[0]), \
+                mock.patch.object(cleanup, "_reg_export", fake_export), mock.patch.object(cleanup, "_delete_service", return_value=1060), \
+                mock.patch.object(cleanup, "_delete_key_tree", fake_tree_delete):
+            result, _ = run([item("service", location)])
+        self.assertEqual((result.removed, result.failed), (1, []))
+        self.assertEqual(deleted, [(winreg.HKEY_LOCAL_MACHINE, "SYSTEM\\CurrentControlSet\\Services\\UpstreamTestSvc")])
+        self.assertFalse(result.restart_needed, "the key is gone, so there is nothing to finish at the next restart")
+
+    def make_tree(self):
+        """The key with two values, a child `a`, and `b\\c`; returns what snapshot() sees of it."""
+        for child, name in (("", "Name"), ("\\a", "A"), ("\\b\\c", "C")):
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, self.sub + child, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+                winreg.SetValueEx(key, name, 0, winreg.REG_SZ, "value of " + name)
+        return self.snapshot(self.sub)
+
+    def test_a_delete_that_fails_half_way_keeps_the_backup_and_undo_completes_the_tree(self):
+        before = self.make_tree()
+        real, calls = winreg.DeleteKeyEx, []
+
+        def flaky(*args):
+            calls.append(args[1])
+            if len(calls) == 3:     # `a` and `b\c` are gone, `b` is refused
+                raise PermissionError(errno.EACCES, "denied", None, 5)
+            return real(*args)
+
+        with mock.patch.object(cleanup.winreg, "DeleteKeyEx", flaky):
+            result, _ = run([item("regkey", self.location)])
+        self.assertEqual((result.removed, reasons(result)), (0, [cleanup.T_KEY_PARTIAL]))
+        self.assertEqual(result.failed[0][2], {"error": "denied"})
+        self.assertTrue(result.backup_id, "part of the tree is gone: the export must stay")
+        self.assertTrue(self.exists(self.sub) and self.exists(self.sub + "\\b"))
+        self.assertFalse(self.exists(self.sub + "\\a") or self.exists(self.sub + "\\b\\c"))
+        entry = self.manifest(result.backup_id)["items"][0]
+        self.assertEqual(entry["status"], "partial")
+        self.assertGreater((self.tmp / "quarantine" / result.backup_id / entry["reg"]).stat().st_size, 0)
+        self.assertEqual([(b.id, b.items) for b in cleanup.backups()], [(result.backup_id, 1)])
+
+        undone = cleanup.restore(result.backup_id)     # the key exists, but its entry is partial: the export is merged in
+        self.assertEqual((undone.restored, undone.failed, undone.remaining), (1, [], 0))
+        self.assertEqual(self.snapshot(self.sub), before)
+        self.assertEqual(cleanup.backups(), [])
+
+    def test_a_delete_that_fails_before_anything_changed_leaves_no_backup(self):
+        self.make_tree()
+
+        def refuse(*args):
+            raise PermissionError(errno.EACCES, "denied", None, 5)
+
+        with mock.patch.object(cleanup.winreg, "DeleteKeyEx", refuse):
+            result, _ = run([item("regkey", self.location)])
+        self.assertEqual(reasons(result), [cleanup.T_DENIED])
+        self.assertIsNone(result.backup_id)
+
+    def set_value(self, name: str, data: str, sub: str | None = None):
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, sub or self.sub, 0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, data)
+
+    def installed_app(self, folder: Path) -> InstalledApp:
+        return InstalledApp("HKLM64\\Other", "Other App", "1.0", "Vendor", "user", "x64", install_location=str(folder))
+
+    def test_a_startup_entry_that_runs_an_installed_app_now_is_left(self):
+        """The app was installed again while the review was open: its Run value is the new copy's."""
+        other = self.world / "Other"
+        other.mkdir()
+        self.set_value("Updater", f'"{other}\\app.exe" /min')
+        key_text = self.location
+        with mock.patch.object(guard, "protected_value", lambda key, name: None if key == key_text else "protected"):
+            result, _ = run([item("regvalue", f"{key_text}|Updater")], apps=[self.installed_app(other)])
+        self.assertEqual(reasons(result), [leftovers.R_INSIDE_OTHER])
+        self.assertEqual(result.failed[0][2], {"other": "Other App"})
+        self.assertEqual(self.snapshot(self.sub)[""]["Updater"][0], f'"{other}\\app.exe" /min')
+        self.assertIsNone(result.backup_id)
+
+    def test_a_key_that_points_into_an_installed_app_now_is_left(self):
+        other = self.world / "Other"
+        other.mkdir()
+        self.set_value("InstallDir", str(other))
+        result, _ = run([item("regkey", self.location)], apps=[self.installed_app(other)])
+        self.assertEqual(reasons(result), [leftovers.R_KEY_OTHER])
+        self.assertTrue(self.exists(self.sub))
+
+    def test_a_startup_entry_that_changed_since_the_review_is_left(self):
+        self.set_value("Updater", r"C:\Old\updater.exe")
+        key_text = self.location
+        picked = [item("regvalue", f"{key_text}|Updater")]
+        with mock.patch.object(guard, "protected_value", lambda key, name: None if key == key_text else "protected"):
+            baseline = cleanup.snapshot(picked)
+            self.assertEqual(len(baseline), 1)
+            self.set_value("Updater", r"C:\New\updater.exe")
+            result, _ = run(picked, baseline=baseline)
+            self.assertEqual(reasons(result), [cleanup.T_CHANGED])
+            self.assertEqual(self.snapshot(self.sub)[""]["Updater"][0], r"C:\New\updater.exe")
+            self.assertIsNone(result.backup_id)
+            again, _ = run(picked, baseline=cleanup.snapshot(picked))     # a review made now matches
+        self.assertEqual((again.removed, again.failed), (1, []))
+
+    def test_a_key_written_to_since_the_review_is_left(self):
+        self.populate()
+        picked = [item("regkey", self.location)]
+        baseline = cleanup.snapshot(picked)
+        self.assertEqual(len(baseline), 1)
+        self.set_value("Later", "written after the review", self.sub + "\\Child\\Deep")
+        result, _ = run(picked, baseline=baseline)
+        self.assertEqual(reasons(result), [cleanup.T_CHANGED])
+        self.assertTrue(self.exists(self.sub))
+        self.assertIsNone(result.backup_id)
+        self.assertEqual(run(picked, baseline=cleanup.snapshot(picked))[0].removed, 1)
+
+    def test_a_service_whose_image_path_changed_is_left(self):
+        location = "HKLM\\SYSTEM\\CurrentControlSet\\Services\\UpstreamTestSvc"
+        picked = [item("service", location)]
+        states = {"now": "old image"}
+        boom = AssertionError("must not be reached")
+        with mock.patch.object(cleanup, "_state", lambda it: states["now"]), mock.patch.object(cleanup, "is_admin", lambda: True), \
+                mock.patch.object(cleanup, "key_exists", lambda loc: True), mock.patch.object(cleanup, "_reg_export", side_effect=boom), \
+                mock.patch.object(cleanup, "_delete_service", side_effect=boom):
+            baseline = cleanup.snapshot(picked)
+            states["now"] = "another program"
+            result, _ = run(picked, baseline=baseline)
+        self.assertEqual(reasons(result), [cleanup.T_CHANGED])
+        self.assertIsNone(result.backup_id)
+
+    def test_the_state_of_a_service_is_its_image_path(self):
+        service = Leftover("service", self.location, leftovers.CERTAIN, leftovers.R_NAMED)
+        self.set_value("ImagePath", r"C:\Old\svc.exe")
+        old = cleanup._state(service)
+        self.assertIn("svc.exe", old)
+        self.set_value("ImagePath", r"C:\New\svc.exe")
+        self.assertNotEqual(cleanup._state(service), old)
+        self.assertIsNone(cleanup._state(Leftover("service", self.location + "\\Nope", leftovers.CERTAIN, leftovers.R_NAMED)))
+
+    def test_registry_items_are_left_when_the_installed_apps_cannot_be_read(self):
+        self.populate()
+        key_text = self.location
+        picked = [item("regkey", key_text), item("regvalue", f"{key_text}|Count")]
+        with mock.patch.object(guard, "protected_value", lambda key, name: None if key == key_text else "protected"), \
+                mock.patch("upstream.inventory.read_installed_apps", side_effect=OSError("registry unreadable")), \
+                self.assertLogs("upstream.cleanup", "ERROR"):
+            result, _ = run(picked, apps=None)
+        self.assertEqual(reasons(result), [cleanup.T_NO_OWNERS] * 2)
+        self.assertTrue(self.exists(self.sub))
+        self.assertIsNone(result.backup_id)
+
+    def test_a_tampered_backup_cannot_import_a_file_from_elsewhere(self):
+        """A valid export outside the backup folder, named by the manifest, is not imported."""
+        self.populate()
+        result, _ = run([item("regkey", self.location)])
+        folder = self.tmp / "quarantine" / result.backup_id
+        outside = self.tmp / "outside.reg"
+        shutil.copy(folder / self.manifest(result.backup_id)["items"][0]["reg"], outside)
+        for named in ("..\\..\\outside.reg", str(outside)):
+            with self.subTest(named=named):
+                edit_manifest(self.tmp, result.backup_id, reg=named)
+                with mock.patch.object(cleanup, "_reg_import", side_effect=AssertionError("must not import")):
+                    undone = cleanup.restore(result.backup_id)
+                self.assertEqual([t for _, t, _ in undone.failed], [cleanup.R_UNREADABLE])
+                self.assertFalse(self.exists(self.sub))
+
+
+def edit_manifest(tmp: Path, backup_id: str, index: int = 0, **changes) -> None:
+    path = tmp / "quarantine" / backup_id / "manifest.json"
+    data = json.loads(path.read_text("utf-8"))
+    data["items"][index].update(changes)
+    path.write_text(json.dumps(data), "utf-8")
+
+
+class ReadingRegFiles(TempTree):
+    """reg.exe reads a key header after spaces or a tab and ignores a comment behind it, so all of those count."""
+    KEY = "HKCU\\Software\\UpstreamTest_abcd"
+    HOME = "HKEY_CURRENT_USER\\Software\\UpstreamTest_abcd"
+    ELSEWHERE = "HKEY_CURRENT_USER\\Software\\UpstreamTestElsewhere"
+
+    def check(self, *lines: str) -> bool:
+        file = self.tmp / "t.reg"
+        file.write_text("\r\n".join(["Windows Registry Editor Version 5.00", "", f"[{self.HOME}]", '"a"="b"', *lines]), "utf-16")
+        return cleanup._reg_file_inside(file, self.KEY)
+
+    def test_headers_inside_the_key(self):
+        self.assertTrue(self.check())
+        self.assertTrue(self.check("", f"[{self.HOME}\\Child]", '"x"=dword:00000001'))
+        self.assertTrue(self.check(f"  [{self.HOME}\\Child]"), "an indented header of a sub-key is fine")
+
+    def test_a_header_elsewhere_in_any_spelling_refuses_the_file(self):
+        spellings = [f"[{self.ELSEWHERE}]", f" [{self.ELSEWHERE}]", f"\t[{self.ELSEWHERE}]", f"  \t [{self.ELSEWHERE}]  ",
+                     f"[{self.ELSEWHERE}] ; note", f"[{self.ELSEWHERE}]\t;", f"[-{self.ELSEWHERE}]",
+                     f"[{self.HOME}xyz]", "[HKEY_LOCAL_MACHINE\\SOFTWARE\\UpstreamTestElsewhere]"]
+        for line in spellings:
+            with self.subTest(line=line):
+                self.assertFalse(self.check("", line, '"x"="y"'))
+
+    def test_a_header_with_anything_after_the_bracket_refuses_the_file(self):
+        self.assertFalse(self.check(f"[{self.HOME}\\Child] ; harmless"))
+        self.assertFalse(self.check(f"[{self.HOME}] trailing"))
+
+    def test_nothing_inside_means_refused(self):
+        file = self.tmp / "empty.reg"
+        file.write_text("Windows Registry Editor Version 5.00\r\n", "utf-16")
+        self.assertFalse(cleanup._reg_file_inside(file, self.KEY))
+        self.assertFalse(cleanup._reg_file_inside(self.tmp / "missing.reg", self.KEY))
+
+
+class Confinement(TempTree):
+    """The manifest sits in a folder the user can write to: what it names must lie inside its own backup."""
+
+    def test_inside_folder(self):
+        folder = self.tmp / "quarantine" / "20260101-000000-abcdef"
+        folder.mkdir(parents=True)
+        self.assertEqual(cleanup._inside_folder(folder, "files/C/x.txt"), folder / "files/C/x.txt")
+        self.assertEqual(cleanup._inside_folder(folder, "registry\\1.reg"), folder / "registry\\1.reg")
+        for bad in ("..", "../x", "files/../../x", "..\\..\\world", str(self.tmp), "C:\\Windows", "", " ", ".", None, 5, ["a"]):
+            with self.subTest(bad=bad):
+                self.assertIsNone(cleanup._inside_folder(folder, bad))
+
+    def test_a_manifest_cannot_make_a_restore_move_something_else(self):
+        write(self.world / "loose.txt", "loose")
+        secret = write(self.tmp / "secret.txt", "not part of any backup")
+        result, _ = run([item("file", self.world / "loose.txt")])
+        for named in ("..\\..\\secret.txt", str(secret)):
+            with self.subTest(named=named):
+                edit_manifest(self.tmp, result.backup_id, backup=named)
+                with mock.patch.object(cleanup, "_move", side_effect=AssertionError("must not move")):
+                    undone = cleanup.restore(result.backup_id)
+                self.assertEqual([t for _, t, _ in undone.failed], [cleanup.R_UNREADABLE])
+                self.assertEqual(secret.read_text("utf-8"), "not part of any backup")
+                self.assertFalse((self.world / "loose.txt").exists())
+        edit_manifest(self.tmp, result.backup_id, backup=cleanup._backup_dest(Path("."), str(self.world / "loose.txt")).as_posix())
+        self.assertEqual(cleanup.restore(result.backup_id).restored, 1, "the real entry still restores")
+
+    def test_a_link_inside_the_backup_cannot_lead_out_of_it(self):
+        target = self.tmp / "target"
+        write(target / "precious.txt", "keep me")
+        write(self.world / "loose.txt", "loose")
+        result, _ = run([item("file", self.world / "loose.txt")])
+        folder = self.tmp / "quarantine" / result.backup_id
+        link = folder / "files" / "evil"
+        r = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True)
+        if r.returncode:
+            self.skipTest("cannot create a junction here")
+        self.addCleanup(lambda: os.path.isdir(link) and os.rmdir(link))
+        edit_manifest(self.tmp, result.backup_id, backup="files/evil/precious.txt")
+        with mock.patch.object(cleanup, "_move", side_effect=AssertionError("must not move")):
+            undone = cleanup.restore(result.backup_id)
+        self.assertEqual([t for _, t, _ in undone.failed], [cleanup.R_UNREADABLE])
+        self.assertTrue((target / "precious.txt").exists())
+
+
+class ManifestWrites(TempTree):
+    def test_the_manifest_reaches_the_disk_before_it_replaces_the_old_one(self):
+        order = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def fsync(fd):
+            order.append("fsync")
+            real_fsync(fd)
+
+        def replace(src, dst):
+            order.append("replace")
+            real_replace(src, dst)
+
+        target = self.tmp / "manifest.json"
+        with mock.patch.object(cleanup.os, "fsync", fsync), mock.patch.object(cleanup.os, "replace", replace):
+            cleanup._write_json(target, {"app": "ünï", "items": []})
+        self.assertEqual(order, ["fsync", "replace"])
+        self.assertEqual(json.loads(target.read_text("utf-8")), {"app": "ünï", "items": []})
+        self.assertFalse(target.with_suffix(".tmp").exists())
+
+
+class OwnershipFailsClosed(TempTree):
+    def test_files_are_left_when_the_installed_apps_cannot_be_read(self):
+        write(self.world / "a.txt")
+        write(self.world / "App" / "b.txt")
+        picked = [item("file", self.world / "a.txt"), item("folder", self.world / "App")]
+        with mock.patch("upstream.inventory.read_installed_apps", side_effect=OSError("registry unreadable")), \
+                mock.patch.object(cleanup, "_move", side_effect=AssertionError("must not move")), self.assertLogs("upstream.cleanup", "ERROR"):
+            result, _ = run(picked, apps=None)
+        self.assertEqual((result.removed, reasons(result)), (0, [cleanup.T_NO_OWNERS] * 2))
+        self.assertTrue((self.world / "a.txt").exists() and (self.world / "App" / "b.txt").exists())
+        self.assertIsNone(result.backup_id)
+
+    def test_a_protected_item_still_names_its_own_reason(self):
+        with mock.patch("upstream.inventory.read_installed_apps", side_effect=OSError("x")), self.assertLogs("upstream.cleanup", "ERROR"):
+            result, _ = run([item("folder", os.environ.get("SystemRoot", r"C:\Windows"))], apps=None)
+        self.assertNotIn(cleanup.T_NO_OWNERS, reasons(result))
+
 
 class BackupList(TempTree):
     def fake_backup(self, name: str, days_old: float, state: str = "removed") -> str:
@@ -560,6 +858,86 @@ class BackupList(TempTree):
         os.chmod(self.tmp / "quarantine" / backup_id / "files" / "C" / "x.txt", 0o444)
         cleanup.delete_backup(backup_id)
         self.assertFalse((self.tmp / "quarantine" / backup_id).exists())
+
+    def test_delete_says_whether_the_backup_is_gone(self):
+        backup_id = self.fake_backup("Gone", 1)
+        stuck = self.fake_backup("Stuck", 1)
+        self.assertTrue(cleanup.delete_backup(backup_id))
+        self.assertTrue(cleanup.delete_backup(backup_id), "already gone is gone")
+        for bad in ("", "..", "not-an-id", None):
+            self.assertFalse(cleanup.delete_backup(bad))
+        with mock.patch.object(cleanup, "_remove_tree", side_effect=PermissionError(errno.EACCES, "denied", None, 5)), \
+                self.assertLogs("upstream.cleanup", "WARNING"):
+            self.assertFalse(cleanup.delete_backup(stuck), "a backup an elevated Upstream made can't be deleted by a standard one")
+        self.assertEqual([b.id for b in cleanup.backups()], [stuck])
+        self.assertTrue(cleanup.delete_backup(stuck))
+
+    def holding_the_lock(self):
+        """Another thread holds the cleanup lock, the way a running cleanup or undo does."""
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with cleanup._lock:
+                held.set()
+                release.wait(10)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.assertTrue(held.wait(5))
+        return release, thread
+
+    def test_nothing_is_deleted_while_a_cleanup_or_an_undo_runs(self):
+        old, new = self.fake_backup("Old", 40), self.fake_backup("New", 1)
+        release, thread = self.holding_the_lock()
+        try:
+            self.assertFalse(cleanup.delete_backup(new))
+            self.assertEqual(cleanup.purge_old(30), 0)
+            self.assertEqual(len(list((self.tmp / "quarantine").iterdir())), 2)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertEqual(cleanup.purge_old(30), 1)
+        self.assertTrue(cleanup.delete_backup(new))
+
+    def test_an_undo_reads_the_manifest_only_once_it_has_the_lock(self):
+        """A delete that finished while the undo waited must not be undone from a stale copy."""
+        backup_id = self.fake_backup("Waiting", 1)
+        release, thread = self.holding_the_lock()
+        out = []
+        worker = threading.Thread(target=lambda: out.append(cleanup.restore(backup_id)))
+        try:
+            worker.start()
+            time.sleep(0.3)      # the undo is now waiting for the lock
+            shutil.rmtree(self.tmp / "quarantine" / backup_id)
+        finally:
+            release.set()
+            thread.join(5)
+        worker.join(5)
+        self.assertEqual([(w, t) for w, t, _ in out[0].failed], [(backup_id, cleanup.R_UNREADABLE)])
+
+    def test_a_service_export_keeps_its_backup_after_everything_else_is_back(self):
+        backup_id = self.fake_backup("Svc", 1)
+        folder = self.tmp / "quarantine" / backup_id
+        write(folder / "registry" / "2.reg", "export of the service key")
+        path = folder / "manifest.json"
+        data = json.loads(path.read_text("utf-8"))
+        data["items"].append({"n": 2, "kind": "service", "location": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\UpstreamTestSvc",
+                              "reg": "registry/2.reg", "status": "removed", "bytes": 20})
+        path.write_text(json.dumps(data), "utf-8")
+
+        undone = cleanup.restore(backup_id)
+        self.assertEqual((undone.restored, undone.remaining), (1, 0))
+        self.assertEqual([t for _, t, _ in undone.failed], [cleanup.R_SERVICE])
+        self.assertEqual((self.world / "x.txt").read_text("utf-8"), "kept")
+        self.assertTrue(folder.is_dir(), "the service can only be reinstalled by hand: its export stays")
+        self.assertEqual(json.loads(path.read_text("utf-8"))["items"][1]["status"], "manual")
+        self.assertEqual([(b.id, b.items) for b in cleanup.backups()], [(backup_id, 1)])
+
+        again = cleanup.restore(backup_id)
+        self.assertEqual((again.restored, again.remaining, [t for _, t, _ in again.failed]), (0, 0, [cleanup.R_SERVICE]))
+        self.assertTrue(folder.is_dir())
+        self.assertTrue(cleanup.delete_backup(backup_id))
+        self.assertEqual(cleanup.backups(), [])
 
 
 class RestorePoint(TempTree):

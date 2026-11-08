@@ -36,4 +36,8 @@ FA: dict[str, str] = {
     "Nothing was installed. You can change this in Settings.":
         "مسدود شد: ویندوز نتوانست امضای دیجیتال این فایل را برای برنامهٔ {name} تأیید کند. چیزی نصب نشد. "
         "این رفتار را در تنظیمات می‌توانی عوض کنی.",
+    "Not updated automatically: {name} has no published checksum and its signature doesn't match the app's usual "
+    "publisher. Update it yourself from the list.":
+        "به‌صورت خودکار به‌روز نشد: برای برنامهٔ {name} چک‌سام منتشر نشده و امضای فایل با ناشر همیشگی برنامه نمی‌خواند. "
+        "خودت از فهرست به‌روزش کن.",
 }

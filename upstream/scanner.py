@@ -19,15 +19,24 @@ from dataclasses import asdict, dataclass, field
 from . import badges, pins, site, winget
 from .config import DATA_DIR
 from .github import GitHub, RateLimited, Release, discover_token, machine_arch
-from .i18n import render, tr
+from .i18n import N_, num, render, tr
 from .inventory import InstalledApp, read_installed_apps, still_listed
-from .versioning import is_newer, parse_version
+from .versioning import is_newer, parse_version, same_version
 
 log = logging.getLogger("upstream.scan")
 
 META_TTL = 7 * 24 * 3600
+META_RECHECK = 3600            # a manifest that disagrees with the offered version is re-read at most this often
+SIZE_BUDGET = 24.0             # seconds of size lookups one scan may spend, added up over its worker threads
+SIZE_RETRY = 24 * 3600         # a server that gave no size is asked again after this long
+SIZE_OFFLINE_AFTER = 4         # lookups in a row that found no network before the rest of the scan skips them
+SIZE_DEADLINE = 6.0            # seconds one lookup, both of its requests, may take before it is given up on
 SNAPSHOT_FILE = DATA_DIR / "last_scan.json"
 SNAPSHOT_SCHEMA = 1
+SNAPSHOT_FUTURE = 24 * 3600    # a scan time later than now by more than this comes from a clock that was wrong
+# The notes a row gets when GitHub could not be asked; background.py reads them to tell a blind scan from a real one.
+NOTE_GITHUB_UNREACHABLE = N_("GitHub was unreachable")
+NOTE_RATE_LIMITED = N_("GitHub rate limit reached; using winget")
 _snapshot_lock = threading.Lock()
 
 
@@ -43,6 +52,30 @@ class Update:
     notes: str = ""
     installer_type: str | None = None
     winget_mode: str = "upgrade"   # upgrade | install | rollback (an older version, see pins.rollback_update)
+    size: int = 0                  # bytes the update downloads, 0 = unknown: the GitHub asset's size, or what the
+                                   # server of a winget installer or site download reports (see _SizeBudget)
+
+    def size_text(self) -> str:
+        """The download size as a row shows it ('45.2 MB', Persian digits in Persian); '' when it isn't known."""
+        return size_text(self.size)
+
+
+def size_text(size: int) -> str:
+    """Bytes as '45.2 MB' with the digits of the current language; '' for 0 or less."""
+    from .details import format_size    # details pulls in the installer stack; only a screen that shows a size needs it
+    return num(format_size(size)) if size > 0 else ""
+
+
+def download_summary(statuses) -> str:
+    """'312.4 MB to download' for the updates these statuses offer, 'At least ...' when some of them have no known
+    size; '' when no size is known at all."""
+    offered = [s.update for s in statuses if s.update]
+    known = sum(u.size for u in offered if u.size > 0)
+    if not known:
+        return ""
+    if any(u.size <= 0 for u in offered):
+        return tr("At least {size} to download", size=size_text(known))
+    return tr("{size} to download", size=size_text(known))
 
 
 @dataclass
@@ -164,10 +197,30 @@ def _still_there(app: InstalledApp) -> bool:
         return True
 
 
+def _refresh_versions(statuses: list[AppStatus]) -> None:
+    """A restored row shows the version the PC had when the scan ran. An app that updated itself since (or was updated
+    by hand) is listed with its new version: take that entry and drop the offer, which was made for the old one.
+    One read of the registry for all rows; rows it can't answer for keep what the snapshot says."""
+    rows = [s for s in statuses if not s.app.reg_key.startswith("WINGET\\")]
+    if not rows:
+        return
+    try:
+        listed = {app.reg_key: app for app in read_installed_apps()}
+    except Exception:
+        log.warning("Could not re-read the installed versions for the snapshot", exc_info=True)
+        return
+    for s in rows:
+        current = listed.get(s.app.reg_key)
+        if current is not None and current.version != s.app.version:
+            log.info("%s is now %s, not %s as in the last scan", s.app.name, current.version, s.app.version)
+            s.app, s.update, s.fallbacks, s.badges = current, None, [], []
+
+
 def load_snapshot() -> tuple[list[AppStatus], float] | None:
     """(statuses, scan time as a Unix timestamp) from the last saved scan, or None when there is none or it can't be
-    trusted (missing, unreadable, another schema). An entry that doesn't validate, or whose app is no longer
-    installed, is left out; the rescan that follows puts everything right."""
+    trusted (missing, unreadable, another schema, a scan time in the future). An entry that doesn't validate, or whose
+    app is no longer installed, is left out, and one whose version changed since is brought up to date; the rescan
+    that follows puts everything right."""
     try:
         raw = json.loads(SNAPSHOT_FILE.read_text("utf-8"))
     except (OSError, ValueError, RecursionError):
@@ -175,7 +228,8 @@ def load_snapshot() -> tuple[list[AppStatus], float] | None:
     if not isinstance(raw, dict) or raw.get("schema") != SNAPSHOT_SCHEMA or not isinstance(raw.get("statuses"), list):
         return None
     taken = raw.get("time")
-    if isinstance(taken, bool) or not isinstance(taken, (int, float)) or not math.isfinite(taken) or taken <= 0:
+    if (isinstance(taken, bool) or not isinstance(taken, (int, float)) or not math.isfinite(taken)
+            or not 0 < taken <= time.time() + SNAPSHOT_FUTURE):
         return None
     statuses, seen = [], set()
     for entry in raw["statuses"]:
@@ -183,6 +237,7 @@ def load_snapshot() -> tuple[list[AppStatus], float] | None:
         if status and status.uid not in seen and _still_there(status.app):
             seen.add(status.uid)
             statuses.append(status)
+    _refresh_versions(statuses)
     return statuses, float(taken)
 
 
@@ -198,11 +253,63 @@ class _LineGitHub(GitHub):
         return [r for r in self.base.releases(repo, force) if (parse_version(r.version) or (None,))[0] == self.line]
 
 
+class _SizeBudget:
+    """What one scan may spend on asking servers how big a download is: SIZE_BUDGET seconds of requests added up over
+    the worker threads (a few seconds on the clock), and nothing once several in a row found no network. A lookup
+    that is skipped or fails is not remembered, so the next scan tries it again."""
+
+    def __init__(self, seconds: float = SIZE_BUDGET):
+        self.left = seconds
+        self.failed = 0         # requests in a row that could not reach a server
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _ask(url: str) -> int:
+        """winget.remote_size on a thread of its own that is given up on after SIZE_DEADLINE: a name server that does
+        not answer holds a connection attempt far longer than the request timeout."""
+        answer: list = []
+
+        def run():
+            try:
+                answer.append(winget.remote_size(url))
+            except Exception as e:
+                answer.append(e)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(SIZE_DEADLINE)
+        if not answer:
+            raise TimeoutError("no answer in time")
+        if isinstance(answer[0], Exception):
+            raise answer[0]
+        return answer[0]
+
+    def measure(self, url: str) -> int | None:
+        """Bytes the download weighs, 0 when the server doesn't say, None when nothing was learned."""
+        with self._lock:
+            if self.left <= 0 or self.failed >= SIZE_OFFLINE_AFTER:
+                return None
+        started = time.monotonic()
+        size, unreachable = None, 0
+        try:
+            size = self._ask(url)
+        except OSError as e:
+            log.debug("could not ask %s for its size: %s", url, e)
+            unreachable = 1
+        except Exception:
+            log.warning("asking %s for its size failed", url, exc_info=True)
+        with self._lock:
+            self.left -= time.monotonic() - started
+            self.failed = 0 if size is not None else self.failed + unreachable
+        return size
+
+
 class Scanner:
     def __init__(self, settings, cache):
         self.settings = settings
         self.cache = cache
         self.arch = machine_arch()
+        self._sizes = _SizeBudget()
         self._gh: GitHub | None = None
         self._gh_lock = threading.Lock()
 
@@ -259,6 +366,7 @@ class Scanner:
         self._refresh_meta(active, progress)
         self._refresh_eol(active)
 
+        self._sizes = _SizeBudget()
         with ThreadPoolExecutor(max_workers=6) as pool:
             futures = [pool.submit(self.resolve, s, False) for s in active]
             for done, future in enumerate(as_completed(futures), 1):
@@ -276,6 +384,7 @@ class Scanner:
         if status.winget_id:
             self._refresh_meta([status], lambda *a: None, force=status.winget_forced)
         self._refresh_eol([status])
+        self._sizes = _SizeBudget()
         self.resolve(status, True)
         self.cache.save()
         return status
@@ -306,10 +415,18 @@ class Scanner:
     def _meta(self, pkg_id: str | None) -> dict:
         return (self.cache.entry("winget_meta", pkg_id) or {}) if pkg_id else {}
 
+    def _meta_is_stale(self, s: AppStatus, force: bool) -> bool:
+        meta, now = self._meta(s.winget_id), time.time()
+        if force or now - meta.get("ts", 0) > META_TTL or meta.get("v") != winget.META_VERSION:
+            return True
+        # The manifest is older than the update winget offers: its installer, and so its size, are not the one winget
+        # will fetch. Look again, but not on every scan if winget words the version differently.
+        manifest = meta.get("version")
+        return bool(s.winget_available and isinstance(manifest, str) and now - meta.get("ts", 0) > META_RECHECK
+                    and manifest != s.winget_available and not same_version(manifest, s.winget_available))
+
     def _refresh_meta(self, statuses, progress, force=False):
-        ids = sorted({s.winget_id for s in statuses if s.winget_id})
-        stale = [i for i in ids if force or time.time() - self._meta(i).get("ts", 0) > META_TTL
-                 or self._meta(i).get("v") != winget.META_VERSION]
+        stale = sorted({s.winget_id for s in statuses if s.winget_id and self._meta_is_stale(s, force)})
         if not stale:
             return
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -317,15 +434,46 @@ class Scanner:
             for done, future in enumerate(as_completed(futures), 1):
                 progress(tr("Finding each app's official source…"), done, len(stale))
                 try:
-                    self.cache.put("winget_meta", futures[future], future.result())
+                    self._store_meta(futures[future], future.result())
                 except Exception:
                     log.exception("winget show %s failed", futures[future])
         self.cache.save()
 
+    def _store_meta(self, pkg_id: str, meta: dict):
+        """Cache a fresh manifest reading, keeping the installer size already measured for the same installer."""
+        old = self._meta(pkg_id)
+        if (old.get("size_v") is not None and old.get("size_v") == meta.get("version")
+                and old.get("installer_url") == meta.get("installer_url")):
+            meta.update({k: old[k] for k in ("size", "size_v", "size_ts") if k in old})
+        self.cache.put("winget_meta", pkg_id, meta)
+
+    def _winget_size(self, pkg_id: str, meta: dict, version: str, measure: bool) -> int:
+        """Bytes winget downloads to install `version`: the installer's size, measured once per version and kept in
+        the winget meta together with the version it was measured for. Only the update a row actually offers is
+        measured (`measure`); the others use what is cached. 0 = unknown."""
+        manifest, url = meta.get("version"), meta.get("installer_url")
+        if not (isinstance(url, str) and url and isinstance(manifest, str)
+                and (manifest == version or same_version(manifest, version))):
+            return 0    # the cached manifest describes another version than the one on offer
+        if meta.get("size_v") == manifest:
+            size, asked = meta.get("size"), meta.get("size_ts")
+            if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+                return size
+            if isinstance(asked, (int, float)) and time.time() - asked < SIZE_RETRY:
+                return 0    # the server gave no size a short while ago
+        if not measure:
+            return 0
+        size = self._sizes.measure(url)
+        if size is None:
+            return 0
+        self.cache.put("winget_meta", pkg_id, {**self._meta(pkg_id), "size": size, "size_v": manifest,
+                                               "size_ts": time.time()})
+        return size
+
     def _github_update(self, repo: str, res) -> Update:
         return Update("github", res.release.version, repo, download_url=res.asset.url, file_name=res.asset.name,
                       sha256=res.asset.sha256, page_url=res.release.url, notes=res.release.notes,
-                      installer_type=res.installer_type)
+                      installer_type=res.installer_type, size=max(res.asset.size or 0, 0))
 
     def resolve(self, s: AppStatus, fresh: bool):
         app = s.app
@@ -367,10 +515,10 @@ class Scanner:
                     s.set_note("GitHub's version {version} can't be compared with the installed one",
                                version=res.incomparable)
             except RateLimited:
-                s.set_note("GitHub rate limit reached; using winget")
+                s.set_note(NOTE_RATE_LIMITED)
             except Exception as e:
                 log.warning("GitHub check %s failed: %s", s.repo, e)
-                s.set_note("GitHub was unreachable")
+                s.set_note(NOTE_GITHUB_UNREACHABLE)
 
         rule = override.get("site")
         if rule and rule.get("url") and rule.get("version_regex"):
@@ -380,7 +528,9 @@ class Scanner:
                     if pins.blocks(pin, app.version, version):
                         held = True
                     else:
-                        chain.append(Update("site", version, rule["url"], download_url=url, page_url=rule["url"]))
+                        size = (self._sizes.measure(url) or 0) if url else 0
+                        chain.append(Update("site", version, rule["url"], download_url=url, page_url=rule["url"],
+                                            size=size))
             except Exception as e:
                 log.warning("site check for %s failed: %s", app.name, e)
                 if not s.note:
@@ -396,6 +546,7 @@ class Scanner:
             if offer and pins.blocks(pin, app.version, offer.version):
                 held = True
             elif offer:
+                offer.size = self._winget_size(s.winget_id, meta, offer.version, measure=not chain)
                 chain.append(offer)
 
         if chain:

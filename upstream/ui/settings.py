@@ -1,4 +1,5 @@
-"""Settings: language, theme (live preview cards), source options and install safety.
+"""Settings: language, theme (live preview cards), source options, install safety, background, history,
+security badges and leftover cleanup.
 
 Every control applies at once: it writes the settings store and saves, like the checkboxes always did."""
 from __future__ import annotations
@@ -10,9 +11,10 @@ from PySide6.QtCore import QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractButton, QButtonGroup, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel,
-    QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QLineEdit, QMessageBox, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
+from .. import background, history
 from ..i18n import LANGUAGES, N_, tr, trn
 from .theme import THEME_ORDER, THEMES, current, repolish
 
@@ -37,6 +39,9 @@ PROXY_MODES = (("system", N_("Use Windows settings")), ("none", N_("No proxy")),
 PROXY_EXAMPLE = "http://proxy.example.com:8080"
 TIMEOUT_MINUTES = (0, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240)   # 0: wait for ever
 DEFAULT_TIMEOUT = 30
+CHECK_HOURS = (0, 1, 3, 6, 12, 24)                    # 0: no scheduled check
+BACKUP_DAYS = (7, 14, 30, 60, 90, 180, 365)
+DEFAULT_BACKUP_DAYS = 30
 CONTROL_WIDTH = 230
 
 
@@ -65,6 +70,16 @@ def _timeout_minutes(value) -> int:
         return max(0, int(value))
     except (ValueError, OverflowError):
         return DEFAULT_TIMEOUT
+
+
+def _count(value, default: int) -> int:
+    """A stored whole number (hours, days); a hand-edited value that makes no sense becomes the default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default
+    try:
+        return max(0, int(value))
+    except (ValueError, OverflowError):
+        return default
 
 
 def _draw_preview(p: QPainter, area: QRectF, t: dict):
@@ -194,9 +209,37 @@ class _Setting:
         self.control.setAccessibleDescription(tr(self.hint_text))
 
 
+class _Toggle:
+    """A check box with its one-line explanation under it."""
+
+    def __init__(self, title: str, hint: str):
+        self.title_text, self.hint_text = title, hint
+        self.box = QCheckBox()
+        self.hint = QLabel()
+        self.hint.setObjectName("hint")
+        self.hint.setWordWrap(True)
+        note = QHBoxLayout()
+        note.addSpacing(26)     # the check box and its gap: the hint lines up with the text, also when mirrored
+        note.addWidget(self.hint, 1)
+        self.layout = QVBoxLayout()
+        self.layout.setContentsMargins(0, 4, 0, 4)
+        self.layout.setSpacing(2)
+        self.layout.addWidget(self.box)
+        self.layout.addLayout(note)
+
+    def retranslate(self):
+        self.box.setText(tr(self.title_text))
+        self.hint.setText(tr(self.hint_text))
+        self.box.setAccessibleDescription(tr(self.hint_text))
+
+
 class SettingsDialog(QDialog):
     language_changed = Signal(str)
     theme_changed = Signal(str)
+    background_changed = Signal()       # tray, schedule, notifications or start-up changed: Background re-reads them
+    history_cleared = Signal()
+    badges_changed = Signal(bool)       # security badges switched: the rows show or drop them at once
+    backups_requested = Signal()        # the Backups… button: the window opens the dialog
 
     def __init__(self, settings, parent=None):
         super().__init__(parent)
@@ -204,6 +247,8 @@ class SettingsDialog(QDialog):
         self.sources_dirty = False
         self._save_error = ""
         self._note = ("", "")   # the proxy note: (template, tone)
+        self._autostart_failed = False
+        self.toggles: dict[str, _Toggle] = {}
         self.setMinimumWidth(640)
 
         content = QWidget()
@@ -312,6 +357,78 @@ class SettingsDialog(QDialog):
         self.safety_hint = QLabel()
         self.safety_hint.setObjectName("hint")
         lay.addWidget(self.safety_hint)
+        lay.addSpacing(10)
+
+        self.background_title = QLabel()
+        self.background_title.setObjectName("section")
+        lay.addWidget(self.background_title)
+        self._add_toggle(lay, "tray_enabled", N_("Show an icon in the notification area"),
+                         N_("Open Upstream, check for updates and update everything from next to the clock."), False)
+        self._add_toggle(lay, "close_to_tray", N_("Keep running when the window is closed"),
+                         N_("Closing the window hides it. Quit from the icon's menu."), False)
+        self._add_toggle(lay, "start_with_windows", N_("Start with Windows"),
+                         N_("Starts minimized, so scheduled checks run without opening the window."), False,
+                         checked=background.is_autostart())
+        self.autostart_note = QLabel()
+        self.autostart_note.setProperty("tone", "danger")
+        self.autostart_note.setWordWrap(True)
+        self.autostart_note.hide()
+        lay.addWidget(self.autostart_note)
+        saved_hours = _count(settings.get("check_interval_hours", 0), 0)
+        self.check_hours = _Combo()
+        for hours in sorted({*CHECK_HOURS, saved_hours}):
+            self.check_hours.addItem("", hours)
+        self.check_hours.setCurrentIndex(self.check_hours.findData(saved_hours))
+        self.check_hours.currentIndexChanged.connect(
+            lambda _=0: self._on_toggle("check_interval_hours", self.check_hours.currentData()))
+        self._add_row(lay, _Setting(N_("Check for updates automatically"),
+                                    N_("How often Upstream looks in the background while it is running."), self.check_hours))
+        self._add_toggle(lay, "notify_updates", N_("Tell me about new updates"),
+                         N_("A message from the notification area when a check finds updates, once for each version."), True)
+        self.tray_note = QLabel()
+        self.tray_note.setObjectName("hint")
+        self.tray_note.setWordWrap(True)
+        self.tray_note.setVisible(not QSystemTrayIcon.isSystemTrayAvailable())
+        lay.addWidget(self.tray_note)
+        lay.addSpacing(10)
+
+        self.history_title = QLabel()
+        self.history_title.setObjectName("section")
+        lay.addWidget(self.history_title)
+        self._add_toggle(lay, "history_enabled", N_("Keep a history"),
+                         N_("A list of what Upstream installed, updated and removed. It stays on this PC."), True)
+        self.clear_history_btn = QPushButton()
+        self.clear_history_btn.clicked.connect(self._clear_history)
+        self._add_row(lay, _Setting(N_("Clear history"), N_("Deletes the whole list. Your apps and files are not touched."),
+                                    self.clear_history_btn))
+        lay.addSpacing(10)
+
+        self.badges_title = QLabel()
+        self.badges_title.setObjectName("section")
+        lay.addWidget(self.badges_title)
+        self._add_toggle(lay, "security_badges", N_("Show security and end-of-life badges"),
+                         N_("Marks updates whose notes mention security fixes, and versions that no longer get fixes."), True)
+        lay.addSpacing(10)
+
+        self.cleanup_title = QLabel()
+        self.cleanup_title.setObjectName("section")
+        lay.addWidget(self.cleanup_title)
+        self._add_toggle(lay, "cleanup_restore_point", N_("Create a restore point first"),
+                         N_("Asks Windows for a restore point before leftovers are removed. It needs System Protection "
+                            "and administrator rights, and Windows allows only one a day."), True)
+        saved_days = _count(settings.get("cleanup_backup_days", DEFAULT_BACKUP_DAYS), DEFAULT_BACKUP_DAYS)
+        self.backup_days = _Combo()
+        for days in sorted({*BACKUP_DAYS, saved_days}):
+            self.backup_days.addItem("", days)
+        self.backup_days.setCurrentIndex(self.backup_days.findData(saved_days))
+        self.backup_days.currentIndexChanged.connect(
+            lambda _=0: self._on_toggle("cleanup_backup_days", self.backup_days.currentData()))
+        self._add_row(lay, _Setting(N_("Keep backups for"),
+                                    N_("Leftovers that were removed are kept this long, so a cleanup can be undone."),
+                                    self.backup_days))
+        self.backups_btn = QPushButton()
+        self.backups_btn.clicked.connect(self.backups_requested)
+        self._add_row(lay, _Setting(N_("Backups"), N_("Restore or delete what earlier cleanups removed."), self.backups_btn))
         lay.addStretch(1)
 
         self.scroll = QScrollArea()
@@ -369,8 +486,24 @@ class SettingsDialog(QDialog):
         self.src_hint.setText(tr("Source changes apply on the next check."))
         self.safety_title.setText(tr("Install safety"))
         self.safety_hint.setText(tr("These apply from the next update."))
+        self.background_title.setText(tr("Background"))
+        self.history_title.setText(tr("History"))
+        self.badges_title.setText(tr("Security badges"))
+        self.cleanup_title.setText(tr("Leftover cleanup"))
+        self.tray_note.setText(tr("This PC shows no notification area, so the icon and the messages are not available."))
+        self.clear_history_btn.setText(tr("Clear history…"))
+        self.backups_btn.setText(tr("Backups…"))
+        self._show_autostart_note()
+        for toggle in self.toggles.values():
+            toggle.retranslate()
         for row in self.rows:
             row.retranslate()
+        for i in range(self.check_hours.count()):
+            hours = self.check_hours.itemData(i)
+            self.check_hours.setItemText(i, trn("Every {n} hour", "Every {n} hours", hours) if hours else tr("Off"))
+        for i in range(self.backup_days.count()):
+            days = self.backup_days.itemData(i)
+            self.backup_days.setItemText(i, trn("{n} day", "{n} days", days))
         for key, _title, _hint, options in POLICIES:
             for i, (_stored, label) in enumerate(options):
                 self.policy[key].setItemText(i, tr(label))
@@ -405,6 +538,57 @@ class SettingsDialog(QDialog):
     def _set_source(self, key: str, value: bool):
         self._store(key, value)
         self.sources_dirty = True
+
+    # -- background, history, badges, cleanup ---------------------------
+    def _add_toggle(self, lay: QVBoxLayout, key: str, title: str, hint: str, default: bool, checked: bool | None = None):
+        toggle = self.toggles[key] = _Toggle(title, hint)
+        toggle.box.setChecked(bool(self.settings.get(key, default)) if checked is None else checked)
+        toggle.box.toggled.connect(lambda on, k=key: self._on_toggle(k, on))
+        lay.addLayout(toggle.layout)
+
+    def _on_toggle(self, key: str, value):
+        """A switch or a number in these sections: store it, then tell whoever has to act on it."""
+        if key == "start_with_windows":
+            self._set_autostart(bool(value))
+            return
+        self._store(key, value)
+        if key in ("tray_enabled", "close_to_tray", "check_interval_hours", "notify_updates"):
+            self.background_changed.emit()
+        elif key == "security_badges":
+            self.badges_changed.emit(bool(value))
+
+    def _set_autostart(self, on: bool):
+        """The Run entry is the truth: the box shows what Windows will really do, and the setting follows it."""
+        background.set_autostart(on)
+        actual = background.is_autostart()
+        self._autostart_failed = actual != on
+        if self._autostart_failed:
+            box = self.toggles["start_with_windows"].box
+            box.blockSignals(True)
+            box.setChecked(actual)
+            box.blockSignals(False)
+        self._show_autostart_note()
+        self._store("start_with_windows", actual)
+        self.background_changed.emit()
+
+    def _show_autostart_note(self):
+        self.autostart_note.setText(tr("Couldn't change the Windows startup entry.") if self._autostart_failed else "")
+        self.autostart_note.setVisible(self._autostart_failed)
+
+    def _clear_history(self):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(tr("Settings"))
+        box.setText(tr("Clear the whole history?"))
+        box.setInformativeText(tr("This deletes the record of what Upstream installed, updated and removed. "
+                                  "Your apps and files are not touched."))
+        clear = box.addButton(tr("Clear history"), QMessageBox.AcceptRole)
+        keep = box.addButton(tr("Cancel"), QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is clear:
+            history.clear()
+            self.history_cleared.emit()
 
     def _store(self, key: str, value):
         self.settings.set(key, value)

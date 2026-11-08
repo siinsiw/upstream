@@ -6,7 +6,9 @@ that refresh_eol() keeps in the cache (endoflife.date, one small JSON per produc
   security  the offered update's release notes name a CVE or GHSA id, or say security fix / update / patch /
             release or vulnerability (a negation such as "no security fixes" does not count)
   eol       the installed release line is past end of life, or reaches it within 90 days
-  outdated  the installed major version is two or more majors behind the offered update
+  outdated  the installed major version is two or more majors behind the offered update (only for the products in
+            PRODUCTS, whose version numbers are known to mean "major": for any other app a first number can be a year,
+            a marketing number or a build, and "Edge 140 to 142" would be flagged)
 
 End-of-life data exists only for the products in PRODUCTS. An app maps to one when its winget id or its
 registry display name matches a pattern written for it; anything else gets no end-of-life badge. Products
@@ -37,6 +39,7 @@ REQUEST_TIMEOUT = 8
 MAX_BYTES = 2 * 1024 * 1024
 SOON_DAYS = 90
 ROLLING_GRACE_DAYS = 60
+FAILURE_BACKOFF = 3600                       # a table that could not be fetched is not asked for again for this long
 MAJORS_BEHIND = 2
 MAX_IDS = 3
 
@@ -122,11 +125,25 @@ _NOT_NEGATING = re.compile(r"\b(?:no longer|not only)\b")
 _REPORTING = {"report", "reports", "reporting", "disclose", "disclosure", "submit", "responsibly"}
 _POLICY_WORDS = {"disclosure", "reporting", "policy"}
 _NOTHING_AFTER = re.compile(r"[\s:\-–—(]*(?:none|n/a|nil)\b", re.I)
+# The word after a phrase that makes it about a feature or a tool rather than a fix: "vulnerability scanner",
+# "security updates notification", "security update settings".
+_FEATURE_WORDS = {"scanner", "scanners", "scan", "scans", "scanning", "checker", "notification", "notifications",
+                  "notifier", "banner", "banners", "reminder", "reminders", "prompt", "prompts", "dialog", "dialogs",
+                  "setting", "settings", "option", "options", "page", "panel", "tab", "menu", "toggle"}
+_FALSE_POSITIVE = re.compile(r"\bfalse[\s-]+positives?\b", re.I)
+_UNTICKED = re.compile(r"\s*(?:[-*+]|\d+[.)])\s+\[\s?\]")     # a task-list line nobody ticked: "- [ ] Security fix"
+
+
+def _sentence(text: str, start: int, end: int) -> str:
+    left = max(text.rfind(c, 0, start) for c in ".!?\n")
+    stops = [i for i in (text.find(c, end) for c in ".!?\n") if i != -1]
+    return text[left + 1:min(stops, default=len(text))]
 
 
 def _words_before(text: str, start: int) -> list[str]:
-    """The last few words before `start`, within the same sentence."""
-    clause = re.split(r"[.!?;\n]", text[max(0, start - 80):start])[-1]
+    """The last few words before `start`, within the same clause: a comma ends the reach of a negation ("no new
+    features, security fixes and bug fixes only" does not deny the security fixes)."""
+    clause = re.split(r"[.!?;,\n]", text[max(0, start - 80):start])[-1]
     clause = _NOT_NEGATING.sub(" ", clause.replace("’", "'").lower())
     return re.findall(r"[\w']+", clause)[-5:]
 
@@ -148,6 +165,7 @@ def _normal_id(found: str) -> str:
 
 def _scan_notes(notes: str) -> tuple[list[str], bool]:
     """(advisory ids in order of appearance, whether a security phrase stands un-negated)."""
+    notes = "\n".join(line for line in notes.splitlines() if not _UNTICKED.match(line))
     ids: list[str] = []
     phrase = False
     for m in _ID.finditer(notes):
@@ -160,8 +178,12 @@ def _scan_notes(notes: str) -> tuple[list[str], bool]:
         words = _words_before(notes, m.start())
         if _negated(words) or _NOTHING_AFTER.match(notes, m.end()):
             continue
+        following = re.match(r"\s+(\w+)", notes[m.end():])
+        if following and following.group(1).lower() in _FEATURE_WORDS:
+            continue
+        if _FALSE_POSITIVE.search(_sentence(notes, m.start(), m.end())):
+            continue
         if m.group(0).lower().startswith("vuln"):
-            following = re.match(r"\s+(\w+)", notes[m.end():])
             if _REPORTING & set(words) or (following and following.group(1).lower() in _POLICY_WORDS):
                 continue
         phrase = True
@@ -245,7 +267,7 @@ def _eol(status, cache, today) -> Badge | None:
 def _outdated(status, cache, today) -> Badge | None:
     update, app = getattr(status, "update", None), status.app
     product = product_for(status)
-    if update is None or (product and product.rolling):
+    if update is None or product is None or product.rolling:
         return None
     have, offered = versioning.parse_version(app.version), versioning.parse_version(update.version)
     if not have or not offered:
@@ -299,6 +321,11 @@ def _fetch(slug: str) -> list[dict]:
     return cycles
 
 
+# slug -> when it may be asked for again; "" stands for every product (the network itself failed). In memory only: a
+# restart, or an hour, is reason enough to look again, and a blocked endoflife.date must not cost 8 s per scan.
+_failed_until: dict[str, float] = {}
+
+
 def _due(cache, products, now: float) -> list[Product]:
     """The products whose table is missing or older than a week, missing ones first, then the oldest."""
     due = []
@@ -313,14 +340,19 @@ def _due(cache, products, now: float) -> list[Product]:
 
 def refresh_eol(cache, statuses, now: float | None = None) -> None:
     """Fetch endoflife.date tables for the products among `statuses` that are missing or stale (scan worker
-    thread, a few requests at most). Never raises."""
+    thread, a few requests at most). Never raises. What failed is not asked for again for an hour, and an unreachable
+    network ends the whole call after its first request."""
     try:
+        now = time.time() if now is None else now
+        if _failed_until.get("", 0) > now:
+            return
         products: dict[str, Product] = {}
         for status in statuses:
             product = product_for(status)
             if product:
                 products.setdefault(product.slug, product)
-        for product in _due(cache, products.values(), time.time() if now is None else now)[:MAX_REQUESTS]:
+        due = [p for p in _due(cache, products.values(), now) if _failed_until.get(p.slug, 0) <= now]
+        for product in due[:MAX_REQUESTS]:
             try:
                 cache.put("eol", product.slug, {"cycles": _fetch(product.slug)})
             except urllib.error.HTTPError as e:
@@ -329,10 +361,13 @@ def refresh_eol(cache, statuses, now: float | None = None) -> None:
                     cache.put("eol", product.slug, {"cycles": []})
                 else:
                     log.info("endoflife.date answered %s for %s", e.code, product.slug)
+                    _failed_until[product.slug] = now + FAILURE_BACKOFF
             except ValueError as e:
                 log.info("endoflife.date data for %s unusable: %s", product.slug, e)
+                _failed_until[product.slug] = now + FAILURE_BACKOFF
             except (OSError, http.client.HTTPException) as e:
                 log.info("endoflife.date unreachable (%s); skipping the rest", e)
+                _failed_until[""] = now + FAILURE_BACKOFF
                 break
     except Exception:
         log.warning("refreshing end-of-life data failed", exc_info=True)

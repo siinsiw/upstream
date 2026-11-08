@@ -10,8 +10,14 @@ backed up into DATA_DIR/quarantine/<id>/ and only then removed:
     registry/*.reg  registry keys and services, exported with reg.exe
 
 A startup entry is a single registry value, so it is written into the manifest. restore() puts everything
-back and never overwrites what exists now. Nothing here raises for a single item: a refusal or failure is
-returned in CleanupResult.failed with an English template (the UI translates it).
+back and never overwrites what exists now, except a registry key whose removal failed half way (status
+"partial"): its export is merged back in. A service can't be restored (status "manual"): its backup stays
+until it is deleted. Nothing here raises for a single item: a refusal or failure is returned in
+CleanupResult.failed with an English template (the UI translates it).
+
+A registry item is looked at again right before it goes: it must hold what snapshot() saw when the review
+was made, and must not belong to an installed app now. The manifest is not trusted either: what it names
+has to lie inside its own backup folder.
 
 Rights: Upstream never raises its own. What needs administrator rights (HKLM, services, many Program Files
 folders) fails with a clear message when Upstream is not elevated."""
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import json
 import logging
 import os
@@ -49,11 +56,14 @@ MANIFEST = "manifest.json"
 T_CHANGED = N_("It changed after the list was made, so it was left in place")
 T_LINK_INSIDE = N_("It contains a link to somewhere else, which Upstream never follows, so it was left in place")
 T_IN_USE = N_("A program is using it. Close the program and try again.")
-T_ADMIN = N_("It needs administrator rights. Upstream never raises its own rights: start it as administrator to remove this.")
+T_ADMIN = N_("It needs administrator rights. Upstream never gives itself administrator rights: start it as administrator "
+             "to remove this.")
 T_DENIED = N_("Windows denied access to it. A program may be using it.")
 T_NO_SPACE = N_("There is not enough free disk space for the backup, so it was left in place")
 T_BACKUP_FAILED = N_("The backup failed, so nothing was removed: {error}")
 T_PARTIAL = N_("Only part of it could be removed. The rest is in use and stays where it is.")
+T_KEY_PARTIAL = N_("Part of this key was removed before it failed: {error}. The backup holds all of it, so Undo puts it back.")
+T_NO_OWNERS = N_("Upstream couldn't check which installed apps use this, so it was left in place")
 T_FAILED = N_("Couldn't remove it: {error}")
 T_SERVICE_FAILED = N_("Windows refused to remove the service: {error}")
 T_UNKNOWN_KIND = N_("Upstream doesn't know how to remove this kind of item")
@@ -72,7 +82,10 @@ REASONS = tuple(v for k, v in sorted(globals().items()) if k[:2] in ("T_", "R_")
 _ID = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{6}$")
 _HIVES = {"HKCU": winreg.HKEY_CURRENT_USER, "HKLM": winreg.HKEY_LOCAL_MACHINE}
 _LIVE = ("pending", "removed", "partial")    # entries that still have something to restore
+_KEPT = _LIVE + ("manual",)                  # entries that keep their backup folder: a service is only ever restored by hand
 _PATH_KINDS = ("folder", "file", "shortcut")
+_REG_KINDS = ("regkey", "regvalue", "service")
+_TREE_NODES = 5000    # registry keys read when a key's state is fingerprinted
 _ATTR_REPARSE = 0x400
 _WIN_ACCESS_DENIED, _WIN_SHARING, _WIN_LOCK, _WIN_NOT_SAME_DEVICE = 5, 32, 33, 17
 _ERROR_SERVICE_DOES_NOT_EXIST, _ERROR_SERVICE_MARKED_FOR_DELETE = 1060, 1072
@@ -197,9 +210,27 @@ def _long(path: str) -> str:
 
 
 def _write_json(path: Path, data: dict) -> None:
+    """Replace the file atomically; the bytes reach the disk before the new name does, so a power loss leaves
+    the old manifest or the new one, never an empty file."""
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), "utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, ensure_ascii=False, separators=(",", ":")))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+def _inside_folder(folder: Path, relative) -> Path | None:
+    """`folder / relative` when it really lies below the backup folder, else None. A manifest sits in a folder
+    the user can write to, so what it names is not trusted: '..', absolute paths and links out are refused."""
+    if not isinstance(relative, str) or not relative.strip():
+        return None
+    try:
+        base = folder.resolve()
+        path = folder / relative
+        return path if base in path.resolve().parents else None
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def _load(folder: Path) -> dict | None:
@@ -400,10 +431,12 @@ def _discard(path: str, is_dir: bool) -> None:
         log.warning("Could not remove the unfinished backup %s", path)
 
 
-def _check_path(item: Leftover, path: str, others: list[tuple[str, str]]) -> os.stat_result:
+def _check_path(item: Leftover, path: str, others: list[tuple[str, str]] | None) -> os.stat_result:
     why = guard.protected_path(path)
     if why:
         raise _Refuse(why)
+    if others is None:
+        raise _Refuse(T_NO_OWNERS)
     norm = guard.normalize(path)
     for root, name in others:
         if guard.inside(norm, root) or guard.inside(root, norm):
@@ -504,11 +537,19 @@ def _reg_file_inside(file: Path, location: str) -> bool:
         text = file.read_text("utf-16")
     except (OSError, UnicodeError):
         return False
-    keys = [line.strip()[1:-1].lower() for line in text.splitlines() if line.startswith("[") and line.rstrip().endswith("]")]
+    keys = []
+    for line in text.splitlines():
+        line = line.strip()     # reg.exe also reads a header after spaces or a tab, and ignores a comment behind it
+        if line.startswith("["):
+            if not line.endswith("]"):
+                return False
+            keys.append(line[1:-1].lower())
     return bool(keys) and all(k == top or k.startswith(top + "\\") for k in keys)
 
 
-def _delete_key_tree(hive: int, sub: str, depth: int = 0) -> None:
+def _delete_key_tree(hive: int, sub: str, depth: int = 0, gone: list | None = None) -> None:
+    """Delete a key and everything below it, children first. `gone` collects what was deleted, so a caller
+    that sees a failure knows whether the tree was already changed."""
     if depth > 64:
         raise OSError("the registry key is nested too deeply")
     names = []
@@ -519,8 +560,10 @@ def _delete_key_tree(hive: int, sub: str, depth: int = 0) -> None:
             except OSError:
                 break
     for name in names:
-        _delete_key_tree(hive, f"{sub}\\{name}", depth + 1)
+        _delete_key_tree(hive, f"{sub}\\{name}", depth + 1, gone)
     winreg.DeleteKeyEx(hive, sub, winreg.KEY_WOW64_64KEY)
+    if gone is not None:
+        gone.append(sub)
 
 
 def _check_key(item: Leftover) -> None:
@@ -553,13 +596,96 @@ def _decode_value(value: dict):
     return bytes.fromhex(value["bytes"]) if "bytes" in value else value.get("data")
 
 
-def _remove_key(item: Leftover, session: _Session, admin: bool) -> int:
+def _value_state(hive: int, sub: str, name: str) -> str | None:
+    try:
+        return json.dumps(_read_value(hive, sub, name), sort_keys=True)
+    except OSError:
+        return None
+
+
+def _key_state(hive: int, sub: str) -> str | None:
+    """A fingerprint of a key and everything below it: key names, value counts and last-write times. Whatever
+    writes into the tree afterwards (a reinstall, the app still running) changes it."""
+    digest, nodes, stack = hashlib.blake2b(digest_size=16), 0, [sub]
+    while stack and nodes < _TREE_NODES:
+        path = stack.pop()
+        try:
+            with _open(hive, path, winreg.KEY_READ) as key:
+                subs, values, written = winreg.QueryInfoKey(key)
+                children = [winreg.EnumKey(key, i) for i in range(subs)]
+        except OSError:
+            return None
+        nodes += 1
+        digest.update(f"{path.lower()}|{subs}|{values}|{written}\n".encode())
+        stack.extend(f"{path}\\{name}" for name in reversed(children))
+    return digest.hexdigest() + ("+" if stack else "")
+
+
+def _state(item: Leftover) -> str | None:
+    """What a registry item holds right now (a Run value's data, a service's ImagePath, a key's tree), None when it can't be read."""
+    try:
+        if item.kind == "regvalue":
+            key, _, name = item.location.partition("|")
+            return _value_state(*_split_location(key), name)
+        hive, sub = _split_location(item.location)
+    except KeyError:
+        return None
+    return _value_state(hive, sub, "ImagePath") if item.kind == "service" else _key_state(hive, sub)
+
+
+def snapshot(items) -> dict:
+    """What the registry items of a review hold when it is made. Pass it to run() as `baseline`: an item that
+    holds something else by the time it is removed (a reinstall wrote to it, a service now runs another program)
+    is left in place. Reads only; items that can't be read are left out."""
+    found = {}
+    for item in items:
+        if item.kind in _REG_KINDS and item.confidence != leftovers.PROTECTED:
+            state = _state(item)
+            if state is not None:
+                found[_identity(item)] = state
+    return found
+
+
+def _owner_in(text: str, others: list[tuple[str, str]]) -> str | None:
+    """Name of the installed app whose folder a command line or registry value points into."""
+    lowered = os.path.normcase(os.path.expandvars(text)).replace("\\??\\", "")
+    return next((name for root, name in others if root in lowered and leftovers._into(root).search(lowered)), None)
+
+
+def _registry_texts(item: Leftover, value: dict | None = None) -> list[str]:
+    """The strings that say what a registry item belongs to: a Run value's command, a service's ImagePath, the
+    string values of a key and of its first children (as the scan reads them)."""
+    head, _, sub = item.location.partition("\\")
+    if item.kind == "regvalue":
+        return [value["data"]] if value and isinstance(value.get("data"), str) else []
+    if item.kind == "service":
+        return [leftovers._string(head.upper(), sub, "ImagePath")]
+    paths = [sub, *[f"{sub}\\{child}" for child in leftovers._subkeys(head.upper(), sub)[:200]]]
+    return [text for path in paths for _, text in leftovers._strings(head.upper(), path)]
+
+
+def _recheck(item: Leftover, others, baseline, value: dict | None = None) -> None:
+    """The state check right before a registry item goes: it still holds what the review saw, and it does not
+    belong to an installed app now (the app may have been installed again while the review was open)."""
+    before = baseline.get(_identity(item)) if baseline else None
+    if before is not None and _state(item) != before:
+        raise _Refuse(T_CHANGED)
+    if others is None:
+        raise _Refuse(T_NO_OWNERS)
+    for text in _registry_texts(item, value):
+        name = _owner_in(text, others)
+        if name:
+            raise _Refuse(leftovers.R_KEY_OTHER if item.kind == "regkey" else leftovers.R_INSIDE_OTHER, other=name)
+
+
+def _remove_key(item: Leftover, session: _Session, admin: bool, others, baseline) -> int:
     _check_key(item)
     if not admin and _machine_wide(item):
         raise _Refuse(T_ADMIN)
     hive, sub = _split_location(item.location)
     if not key_exists(item.location):
         raise _Gone
+    _recheck(item, others, baseline)
     entry = session.add({"kind": item.kind, "location": item.location, "reason": item.reason,
                          "reason_values": item.reason_values, "status": "pending", "bytes": 0})
     dest = session.dir / "registry" / f"{entry['n']}.reg"
@@ -570,16 +696,19 @@ def _remove_key(item: Leftover, session: _Session, admin: bool) -> int:
     except (_BackupFailed, OSError, subprocess.SubprocessError) as e:
         session.drop(entry)
         raise _Refuse(T_BACKUP_FAILED, error=str(e)) from None
+    gone: list[str] = []
     try:
-        if item.kind == "service":
-            _remove_service(item)
-        else:
-            _delete_key_tree(hive, sub)
+        if item.kind != "service" or _remove_service(item):
+            _delete_key_tree(hive, sub, gone=gone)
     except _Refuse:
         session.drop(entry)
         dest.unlink(missing_ok=True)
         raise
     except OSError as e:
+        if gone:    # children are already deleted: the export is the only copy of them, so it stays
+            entry["status"] = "partial"
+            session.save()
+            raise _Refuse(T_KEY_PARTIAL, error=_error_text(e)) from None
         session.drop(entry)
         dest.unlink(missing_ok=True)
         raise _map_oserror(e, admin) from None
@@ -605,19 +734,22 @@ def _delete_service(name: str) -> int:
         _advapi32.CloseServiceHandle(scm)
 
 
-def _remove_service(item: Leftover) -> None:
+def _remove_service(item: Leftover) -> bool:
     """Delete through the service manager: it is the only supported way, and a running service is only
-    marked for deletion until it stops (the registry key stays until then)."""
+    marked for deletion until it stops (the registry key stays until then). True when Windows has no such
+    service: only a leftover key is there, and the caller deletes that."""
     name = item.location.rstrip("\\").rsplit("\\", 1)[-1]
     code = _delete_service(name)
-    if code in (0, _ERROR_SERVICE_DOES_NOT_EXIST, _ERROR_SERVICE_MARKED_FOR_DELETE):
-        return
+    if code in (0, _ERROR_SERVICE_MARKED_FOR_DELETE):
+        return False
+    if code == _ERROR_SERVICE_DOES_NOT_EXIST:
+        return True
     if code == _WIN_ACCESS_DENIED:
         raise _Refuse(T_ADMIN)
     raise _Refuse(T_SERVICE_FAILED, error=f"Windows error {code}")
 
 
-def _remove_value(item: Leftover, session: _Session, admin: bool) -> int:
+def _remove_value(item: Leftover, session: _Session, admin: bool, others, baseline) -> int:
     key, _, name = item.location.partition("|")
     why = guard.protected_value(key, name)
     if why:
@@ -629,6 +761,7 @@ def _remove_value(item: Leftover, session: _Session, admin: bool) -> int:
         value = _read_value(hive, sub, name)
     except FileNotFoundError:
         raise _Gone from None
+    _recheck(item, others, baseline, value)
     entry = session.add({"kind": "regvalue", "location": item.location, "reason": item.reason,
                          "reason_values": item.reason_values, "value": value, "status": "pending", "bytes": 0})
     try:
@@ -670,13 +803,14 @@ def _create_restore_point(app_name: str, cancel) -> bool:
 
 # ------------------------------------------------------------------------------ run
 
-def _installed_apps() -> list:
+def _installed_apps() -> list | None:
+    """The installed apps, None when they can't be read: the ownership check then fails closed."""
     try:
         from .inventory import read_installed_apps
         return read_installed_apps()
     except Exception:
         log.exception("could not read the installed apps for the ownership check")
-        return []
+        return None
 
 
 def _other_roots(apps) -> list[tuple[str, str]]:
@@ -700,23 +834,25 @@ def _identity(item: Leftover) -> tuple[str, str]:
     return item.kind, guard.normalize(item.location) if item.kind in _PATH_KINDS else item.location.lower()
 
 
-def _remove_one(item: Leftover, session: _Session, others, admin: bool) -> int:
+def _remove_one(item: Leftover, session: _Session, others, admin: bool, baseline) -> int:
     if item.confidence == leftovers.PROTECTED:
         raise _Refuse(item.reason, **item.reason_values)
     if item.kind in _PATH_KINDS:
         return _remove_path(item, session, others, admin)
     if item.kind in ("regkey", "service"):
-        return _remove_key(item, session, admin)
+        return _remove_key(item, session, admin, others, baseline)
     if item.kind == "regvalue":
-        return _remove_value(item, session, admin)
+        return _remove_value(item, session, admin, others, baseline)
     raise _Refuse(T_UNKNOWN_KIND)
 
 
 def run(items: list[Leftover], app_name: str, progress, cancel=None, *, apps: list | None = None,
-        restore_point: bool | None = None) -> CleanupResult:
+        restore_point: bool | None = None, baseline: dict | None = None) -> CleanupResult:
     """Back up then remove the ticked leftovers. progress(template, percent, **values), percent -1 when unknown.
     `cancel` stops before the next item. `apps` are the installed apps whose folders are off limits (read from
-    the registry when None); `restore_point` overrides the cleanup_restore_point setting."""
+    the registry when None; when that fails, whatever needs the check is left in place); `restore_point`
+    overrides the cleanup_restore_point setting; `baseline` is snapshot() of the review: a registry item that
+    holds something else now is left in place."""
     result = CleanupResult()
     todo, seen = [], set()
     for item in sorted(items, key=_order):
@@ -726,7 +862,8 @@ def run(items: list[Leftover], app_name: str, progress, cancel=None, *, apps: li
     if not todo:
         return result
     with _lock:
-        others = _other_roots(_installed_apps() if apps is None else apps)
+        known = _installed_apps() if apps is None else apps
+        others = None if known is None else _other_roots(known)
         admin = is_admin()
         session = _Session(app_name)
         wanted = restore_point
@@ -743,7 +880,7 @@ def run(items: list[Leftover], app_name: str, progress, cancel=None, *, apps: li
                     break
                 progress(P_REMOVE, index * 100 // len(todo), item=item_label(item))
                 try:
-                    freed = _remove_one(item, session, others, admin)
+                    freed = _remove_one(item, session, others, admin, baseline)
                 except _Gone:
                     result.already_gone += 1
                 except _Refuse as e:
@@ -768,7 +905,7 @@ def run(items: list[Leftover], app_name: str, progress, cancel=None, *, apps: li
 # ------------------------------------------------------------------------ backups list
 
 def backups() -> list[Backup]:
-    """Backups that still hold something to restore, newest first."""
+    """Backups that still hold something: items to restore, or a service export kept for reference, newest first."""
     found = []
     try:
         folders = [p for p in QUARANTINE_DIR.iterdir() if p.is_dir() and _ID.match(p.name)]
@@ -776,7 +913,7 @@ def backups() -> list[Backup]:
         return []
     for folder in folders:
         data = _load(folder)
-        live = [e for e in data["items"] if e.get("status") in _LIVE] if data else []
+        live = [e for e in data["items"] if e.get("status") in _KEPT] if data else []
         if live:
             found.append(Backup(folder.name, str(data.get("app", "")), float(data["ts"]), len(live),
                                 sum(int(e.get("bytes") or 0) for e in live)))
@@ -787,33 +924,47 @@ def _backup_folder(backup_id: str) -> Path | None:
     return QUARANTINE_DIR / backup_id if _ID.match(backup_id or "") else None
 
 
-def delete_backup(backup_id: str) -> None:
-    """Delete one backup folder (only one of Upstream's own: the id is checked)."""
+def delete_backup(backup_id: str) -> bool:
+    """Delete one backup folder (only one of Upstream's own: the id is checked). True when it is gone; False when
+    the id is not a backup, when a cleanup or an undo is running right now, or when Windows refused (a backup
+    made by an elevated Upstream can't be deleted by a standard one)."""
     folder = _backup_folder(backup_id)
-    if folder is not None and folder.is_dir():
+    if folder is None or not _lock.acquire(blocking=False):
+        return False
+    try:
+        if not folder.is_dir():
+            return True
         _rmtree_quiet(folder)
+        gone = not folder.exists()
+    finally:
+        _lock.release()
+    if gone:
         log.info("Deleted backup %s", backup_id)
+    return gone
 
 
 def purge_old(days: int) -> int:
-    """Delete backups older than `days`; returns how many were removed. 0 or less keeps everything."""
-    if days <= 0:
+    """Delete backups older than `days`; returns how many were removed. 0 or less keeps everything. Nothing is
+    deleted while a cleanup or an undo runs (the next start tries again)."""
+    if days <= 0 or not _lock.acquire(blocking=False):
         return 0
-    limit, count = time.time() - days * 86400, 0
     try:
-        folders = [p for p in QUARANTINE_DIR.iterdir() if p.is_dir() and _ID.match(p.name)]
-    except OSError:
-        return 0
-    for folder in folders:
-        data = _load(folder)
+        limit, count = time.time() - days * 86400, 0
         try:
-            when = float(data["ts"]) if data else folder.stat().st_mtime
+            folders = [p for p in QUARANTINE_DIR.iterdir() if p.is_dir() and _ID.match(p.name)]
         except OSError:
-            continue
-        if when < limit:
-            delete_backup(folder.name)
-            count += not folder.exists()
-    return count
+            return 0
+        for folder in folders:
+            data = _load(folder)
+            try:
+                when = float(data["ts"]) if data else folder.stat().st_mtime
+            except OSError:
+                continue
+            if when < limit and delete_backup(folder.name):
+                count += 1
+        return count
+    finally:
+        _lock.release()
 
 
 # ---------------------------------------------------------------------------- restore
@@ -824,7 +975,9 @@ def _restore_path(entry: dict, folder: Path) -> str | None:
     why = guard.protected_path(original)
     if why:
         raise _Refuse(why)
-    source = folder / entry["backup"]
+    source = _inside_folder(folder, entry.get("backup"))
+    if source is None:
+        raise _Refuse(R_UNREADABLE)
     if not os.path.lexists(_long(str(source))):
         if entry.get("status") == "pending":    # the move never happened
             return None
@@ -862,14 +1015,17 @@ def _restore_key(entry: dict, folder: Path) -> str | None:
     why = guard.protected_key(location)
     if why:
         raise _Refuse(why)
-    if key_exists(location):
+    partial = entry.get("status") == "partial"    # the removal failed half way: the key is still there, the export has the rest
+    if key_exists(location) and not partial:
         return None if entry.get("status") == "pending" else R_EXISTS
-    reg = folder / entry["reg"]
+    reg = _inside_folder(folder, entry.get("reg"))
+    if reg is None:
+        raise _Refuse(R_UNREADABLE)
     if not reg.is_file():
         raise _Refuse(R_MISSING)
     if not _reg_file_inside(reg, location):
         raise _Refuse(R_UNREADABLE)
-    _reg_import(reg)
+    _reg_import(reg)    # merges: what is missing comes back
     return None
 
 
@@ -895,13 +1051,13 @@ def restore(backup_id: str, progress=None) -> RestoreResult:
     again. Whatever exists now is never overwritten; it is skipped and reported."""
     result = RestoreResult()
     folder = _backup_folder(backup_id)
-    data = _load(folder) if folder is not None else None
-    if data is None:
-        result.failed.append((backup_id, R_UNREADABLE, {}))
-        return result
     progress = progress or (lambda *a, **k: None)
     with _lock:
-        todo = [e for e in reversed(data["items"]) if e.get("status") in _LIVE]
+        data = _load(folder) if folder is not None else None    # read under the lock: another undo or a delete may have just finished
+        if data is None:
+            result.failed.append((backup_id, R_UNREADABLE, {}))
+            return result
+        todo = [e for e in reversed(data["items"]) if e.get("status") in _KEPT]
         for index, entry in enumerate(todo):
             where = str(entry.get("location", ""))
             progress(P_RESTORE, index * 100 // len(todo),
@@ -934,7 +1090,7 @@ def restore(backup_id: str, progress=None) -> RestoreResult:
             entry["status"] = "restored"
             result.restored += 1
         result.remaining = sum(1 for e in data["items"] if e.get("status") in _LIVE)
-        if result.remaining:
+        if result.remaining or any(e.get("status") == "manual" for e in data["items"]):    # a service's export stays
             data["state"] = "partial"
             _write_json(folder / MANIFEST, data)
         else:

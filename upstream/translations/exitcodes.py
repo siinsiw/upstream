@@ -57,7 +57,7 @@ FA: dict[str, str] = {
     "winget says a newer version of this app is already installed":
         "طبق گفتهٔ winget نسخهٔ جدیدتری از این برنامه از قبل نصب است",
     "The download failed winget's integrity check; nothing was installed":
-        "فایل دانلودشده در بررسی صحت winget قبول نشد؛ چیزی نصب نشد",
+        "فایل دانلود‌شده در بررسی صحت winget قبول نشد؛ چیزی نصب نشد",
     "The app is still running. Close it and try again": "برنامه هنوز باز است. آن را ببند و دوباره امتحان کن",
     "A package this app depends on is missing": "یکی از بسته‌هایی که این برنامه به آن نیاز دارد نصب نیست",
     "The installer needs an internet connection": "نصب‌کننده به اتصال اینترنت نیاز دارد",

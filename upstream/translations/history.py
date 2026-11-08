@@ -2,16 +2,16 @@
 FA: dict[str, str] = {
     # kinds of entry
     "New install": "نصب جدید",
-    "Rollback": "برگشت به نسخهٔ قبلی",
+    "Rollback": "بازگشت به نسخهٔ قبلی",
     "Leftover cleanup": "پاک‌سازی باقی‌مانده‌ها",
-    "Cleanup undone": "بازگرداندن پاک‌سازی",
+    "Cleanup undone": "پاک‌سازی برگردانده شد",
     # filter
     "All activity": "همهٔ فعالیت‌ها",
     "Installs": "نصب‌ها",
-    "Rollbacks": "برگشت به نسخهٔ قبلی",
+    "Rollbacks": "بازگشت به نسخهٔ قبلی",
     "Uninstalls": "حذف‌ها",
     "Leftover cleanups": "پاک‌سازی باقی‌مانده‌ها",
-    "Undone cleanups": "پاک‌سازی‌های بازگردانده‌شده",
+    "Undone cleanups": "پاک‌سازی‌های برگردانده‌شده",
     "Show only": "فقط نمایش",
     # when
     "Just now": "همین حالا",
@@ -35,12 +35,12 @@ FA: dict[str, str] = {
     "Installs, updates and uninstalls will be listed here.": "نصب‌ها، به‌روزرسانی‌ها و حذف‌ها اینجا فهرست می‌شوند.",
     "History is turned off": "تاریخچه خاموش است",
     "Turn it on in Settings to keep a record of installs, updates and uninstalls.":
-        "برای ثبت نصب‌ها، به‌روزرسانی‌ها و حذف‌ها آن را از تنظیمات روشن کنید.",
+        "برای ثبت نصب‌ها، به‌روزرسانی‌ها و حذف‌ها آن را از تنظیمات روشن کن.",
     "History is turned off, so new activity is not being recorded. You can turn it on in Settings.":
-        "تاریخچه خاموش است و فعالیت‌های تازه ثبت نمی‌شوند. می‌توانید آن را از تنظیمات روشن کنید.",
+        "تاریخچه خاموش است و فعالیت‌های تازه ثبت نمی‌شوند. می‌توانی آن را از تنظیمات روشن کنی.",
     # clearing
     "Clear the whole history?": "کل تاریخچه پاک شود؟",
     "This deletes the record of what Upstream installed, updated and removed. Your apps and files are not touched.":
-        "ثبت آنچه Upstream نصب، به‌روزرسانی یا حذف کرده پاک می‌شود. برنامه‌ها و فایل‌های شما دست‌نخورده می‌مانند.",
+        "سابقهٔ آنچه Upstream نصب، به‌روزرسانی یا حذف کرده پاک می‌شود. به برنامه‌ها و فایل‌هایت دست نمی‌زند.",
     "Clear history": "پاک کردن تاریخچه",
 }

@@ -228,15 +228,35 @@ def _judge(policy: str, usual: _Usual | None, app: InstalledApp, status: str, si
         _UNVERIFIED_DETAIL)
 
 
-def evaluate(settings, app: InstalledApp, sig_status: str, signer: str) -> Decision:
-    """sig_status is Authenticode's status (Valid, NotSigned, ...); signer is the certificate's CN."""
+def _baseline_only(usual: _Usual | None, app: InstalledApp, status: str, signer: str,
+                   approved: tuple[str, ...]) -> Decision:
+    """The rule for an unattended install of a file with no published checksum: only a Valid signature by the app's
+    known publisher passes. Unsigned open-source builds, and signers nobody knows, are left for the user to install."""
+    if status == "Valid" and signer:
+        if usual is not None and _same_publisher(usual.name, signer, usual.strong):
+            log.info("%s: no checksum, but signed by %s, the usual publisher (%s)", app.name, signer, usual.name)
+            return Decision("allow")
+        if any(_same_publisher(name, signer) for name in approved):
+            log.info("%s: no checksum, but signed by %s, which you accepted earlier", app.name, signer)
+            return Decision("allow")
+    return Decision("block", "Not updated automatically: {name} has no published checksum and its signature doesn't "
+                             "match the app's usual publisher. Update it yourself from the list.", {"name": app.name})
+
+
+def evaluate(settings, app: InstalledApp, sig_status: str, signer: str, *, require_baseline: bool = False) -> Decision:
+    """sig_status is Authenticode's status (Valid, NotSigned, ...); signer is the certificate's CN.
+    require_baseline is for an unattended install of a file with no published SHA-256, which nobody can look at
+    first: it must then be validly signed by a publisher the app is known by, or it is blocked (the publisher policy
+    "off" still switches the whole check off). Left False, the policy decides alone, as for a manual install."""
     status = sig_status or "Unknown"
     signer = (signer or "").strip()
     _seen[(app.ident, signer)] = status
     policy = _policy(settings)
     if policy == "off":
         return Decision("allow")
-    decision = _judge(policy, _expected(settings, app), app, status, signer, tuple(_approved(settings, app.ident)))
+    usual, approved = _expected(settings, app), tuple(_approved(settings, app.ident))
+    decision = (_baseline_only(usual, app, status, signer, approved) if require_baseline
+                else _judge(policy, usual, app, status, signer, approved))
     if decision.action != "allow":
         log.warning("%s: %s - %s", app.name, decision.action, english(decision.template, decision.values))
     return decision

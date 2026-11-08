@@ -26,9 +26,10 @@ INSTALLED = types.SimpleNamespace(kind="installed", ok=True, template="Installed
                                   values={"version": "2.0"}, version="2.0")
 
 
-def make_status(source="github"):
+def make_status(source="github", sha256=None):
     app = InstalledApp(reg_key=r"HKLM64\X", name="Demo", version="1.0", publisher="Demo Inc", scope="machine", arch="x64")
-    upd = Update(source, "2.0", "o/r", download_url="https://example.invalid/demo.exe", file_name="demo.exe")
+    upd = Update(source, "2.0", "o/r", download_url="https://example.invalid/demo.exe", file_name="demo.exe",
+                 sha256=sha256)
     return AppStatus(app, update=upd)
 
 
@@ -37,7 +38,8 @@ def asking(action="ask"):
 
 
 def run_direct(test: unittest.TestCase, steps=(0,), signature=("Valid", "Demo Inc"), decision=None, answer=None,
-               detect="msi", refuse=None, close=None, ctx=None, verdict=INSTALLED, delete_fails=False):
+               detect="msi", refuse=None, close=None, ctx=None, verdict=INSTALLED, delete_fails=False, sha256=None,
+               evaluate=None):
     """Run one direct update on a real file in a temp folder. `steps` are what installer.install does on each run
     (an exit code, or an exception to raise). Returns what happened: result, calls, path, remember, checks, questions."""
     tmp = tempfile.TemporaryDirectory()
@@ -86,7 +88,8 @@ def run_direct(test: unittest.TestCase, steps=(0,), signature=("Valid", "Demo In
         mock.patch.object(updater.installer, "signature", lambda p: signature),
         mock.patch.object(updater.installer, "detect", detect_kind),
         mock.patch.object(updater.installer, "install", install),
-        mock.patch.object(updater.trust, "evaluate", lambda *a: decision or mock.Mock(action="allow")),
+        mock.patch.object(updater.trust, "evaluate",
+                          evaluate or (lambda *a, **k: decision or mock.Mock(action="allow"))),
         mock.patch.object(updater.trust, "remember", run.remember),
         mock.patch.object(updater.inplace, "plan", lambda *a: plan),
         mock.patch.object(updater.running, "close_for_update", close_apps),
@@ -101,7 +104,7 @@ def run_direct(test: unittest.TestCase, steps=(0,), signature=("Valid", "Demo In
             stack.enter_context(p)
         if delete_fails:
             stack.enter_context(test.assertLogs("upstream.update", "WARNING"))
-        run.result = updater.Updater().run(make_status(), lambda *a, **k: None, ctx)
+        run.result = updater.Updater().run(make_status(sha256=sha256), lambda *a, **k: None, ctx)
     run.ctx = ctx
     return run
 
@@ -131,6 +134,125 @@ class PipelineTest(unittest.TestCase):
             ok, template, values, _ = updater.Updater().run(status, lambda *a, **k: None, UpdateContext())
         self.assertFalse(ok)
         self.assertEqual(tried, [])
+
+
+class UnattendedTest(unittest.TestCase):
+    """UpdateContext(auto=True): an update nobody is watching must never open a window or wait for an answer."""
+
+    def test_an_installer_with_no_silent_mode_is_not_run(self):
+        run = run_direct(self, detect="exe", ctx=UpdateContext(auto=True))
+        ok, template, values, version = run.result
+        self.assertFalse(ok)
+        self.assertEqual(version, "1.0")
+        self.assertEqual(template, "{name} has an installer with no silent mode, so it can't be updated unattended. "
+                                   "Update it yourself from the list.")
+        self.assertEqual(values, {"name": "Demo"})
+        self.assertEqual(run.calls, ["preflight", "download", "detect"])    # nothing closed, snapshotted or run
+        self.assertFalse(run.path.exists(), "the downloaded installer is deleted")
+
+    def test_the_same_installer_runs_for_a_manual_update(self):
+        run = run_direct(self, detect="exe", ctx=UpdateContext())
+        self.assertTrue(run.result[0])
+        self.assertEqual(run.calls[-1], "install")
+
+    def test_every_installer_with_a_silent_mode_runs_unattended(self):
+        for kind in ("msi", "msix", "inno", "nullsoft", "burn", "installshield", "advancedinstaller", "squirrel"):
+            with self.subTest(kind):
+                run = run_direct(self, detect=kind, ctx=UpdateContext(auto=True))
+                self.assertTrue(run.result[0])
+                self.assertEqual(run.calls[-1], "install")
+
+    def test_the_next_source_is_tried_when_the_installer_has_no_silent_mode(self):
+        status = make_status()
+        status.fallbacks = [Update("winget", "2.0", "Demo.Demo")]
+        tried = []
+
+        def direct(self, app, upd, progress, ctx):
+            tried.append("direct")
+            raise InstallError("{name} has an installer with no silent mode, so it can't be updated unattended. "
+                               "Update it yourself from the list.", name=app.name)
+
+        def winget_run(self, app, upd, progress, ctx):
+            tried.append("winget")
+            return updater.Attempt(Outcome("ok"))
+
+        with mock.patch.object(updater.net, "preflight"), \
+                mock.patch.object(updater.Updater, "_direct", direct), \
+                mock.patch.object(updater.Updater, "_winget", winget_run), \
+                mock.patch.object(updater.verify, "check", lambda *a, **k: INSTALLED):
+            ok, _, _, _ = updater.Updater().run(status, lambda *a, **k: None, UpdateContext(auto=True))
+        self.assertEqual((ok, tried), (True, ["direct", "winget"]))
+
+    def test_trust_is_told_when_nothing_vouches_for_an_unattended_file(self):
+        cases = [("unattended, no checksum", UpdateContext(auto=True), None, True),
+                 ("unattended, with a checksum", UpdateContext(auto=True), "ab" * 32, False),
+                 ("manual, no checksum", UpdateContext(), None, False),
+                 ("manual, with a checksum", UpdateContext(), "ab" * 32, False)]
+        for label, ctx, sha, expected in cases:
+            with self.subTest(label):
+                seen = []
+
+                def evaluate(*a, **k):
+                    seen.append(k)
+                    return mock.Mock(action="allow")
+
+                run_direct(self, ctx=ctx, sha256=sha, evaluate=evaluate)
+                self.assertEqual(seen, [{"require_baseline": expected}])
+
+    def test_a_blocked_unattended_file_is_not_installed(self):
+        block = mock.Mock(action="block", template="Not updated automatically: {name}", values={"name": "Demo"})
+        run = run_direct(self, ctx=UpdateContext(auto=True), decision=block)
+        self.assertEqual((run.result[0], run.result[1]), (False, "Not updated automatically: {name}"))
+        self.assertNotIn("install", run.calls)
+
+
+class WingetTimeoutTest(unittest.TestCase):
+    """winget gets the same install_timeout_min as an installer run (0 = no limit)."""
+
+    def run_winget(self, settings, mode="upgrade", version="2.0"):
+        status = AppStatus(make_status().app, update=Update("winget", version, "Demo.Demo", winget_mode=mode))
+        seen = []
+
+        def fake_winget(origin, mode, on_progress, on_line, **kwargs):
+            seen.append(kwargs)
+            return 0, ""
+
+        with mock.patch.object(updater.net, "preflight"), \
+                mock.patch.object(updater.running, "close_for_update", lambda *a: None), \
+                mock.patch.object(updater.verify, "snapshot", lambda app: object()), \
+                mock.patch.object(updater.winget, "update", fake_winget), \
+                mock.patch.object(updater.verify, "check", lambda *a, **k: INSTALLED):
+            updater.Updater().run(status, lambda *a, **k: None, UpdateContext(settings))
+        (kwargs,) = seen
+        return kwargs["timeout_min"]
+
+    def test_the_setting_is_passed_on(self):
+        self.assertEqual(self.run_winget({"install_timeout_min": 45}), 45)
+        self.assertEqual(self.run_winget({"install_timeout_min": "12"}), 12)
+
+    def test_zero_means_no_limit(self):
+        self.assertEqual(self.run_winget({"install_timeout_min": 0}), 0)
+        self.assertEqual(self.run_winget({"install_timeout_min": -5}), 0)
+
+    def test_a_missing_or_broken_setting_means_the_default(self):
+        self.assertEqual(self.run_winget(None), installer.DEFAULT_TIMEOUT_MIN)
+        self.assertEqual(self.run_winget({}), installer.DEFAULT_TIMEOUT_MIN)
+        self.assertEqual(self.run_winget({"install_timeout_min": "soon"}), installer.DEFAULT_TIMEOUT_MIN)
+
+    def test_a_rollback_and_a_first_install_get_it_too(self):
+        self.assertEqual(self.run_winget({"install_timeout_min": 7}, mode="rollback", version="1.5"), 7)
+        self.assertEqual(self.run_winget({"install_timeout_min": 7}, mode="install"), 7)
+
+    def test_a_timeout_ends_the_run_like_a_cancelled_wait(self):
+        status = AppStatus(make_status().app, update=Update("winget", "2.0", "Demo.Demo"))
+        error = StoppedWaiting("The installer was still running after {minutes} minutes, so Upstream stopped waiting "
+                               "for it. It may still be running.", minutes="30")
+        with mock.patch.object(updater.net, "preflight"), \
+                mock.patch.object(updater.running, "close_for_update", lambda *a: None), \
+                mock.patch.object(updater.verify, "snapshot", lambda app: object()), \
+                mock.patch.object(updater.winget, "update", side_effect=error):
+            ok, template, values, version = updater.Updater().run(status, lambda *a, **k: None, UpdateContext())
+        self.assertEqual((ok, template, values, version), (False, error.template, {"minutes": "30"}, "1.0"))
 
 
 class SnapshotTest(unittest.TestCase):

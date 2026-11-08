@@ -18,15 +18,17 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QBrush, QColor, QGuiApplication, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
+    QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
     QProgressBar, QPushButton, QSizePolicy, QStackedWidget, QStyledItemDelegate, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
 from .. import cleanup, guard, leftovers, uninstaller
+from ..details import format_size
 from ..i18n import english, isolate, num, render, tr, trn
 from ..inventory import InstalledApp
 from ..scanner import AppStatus
+from ..versioning import parse_version
 from . import theme
 from .theme import current, letter_avatar
 from .widgets import ElidedLabel, ui_is_rtl
@@ -42,6 +44,9 @@ _PATH_KINDS = ("folder", "file", "shortcut")
 _RUNNING: set[str] = set()   # apps whose uninstaller runs, and cleanups under way, even if their dialog was closed
 _ROW_ROLE = Qt.UserRole + 1   # "group" | "protected": the delegate colours these from the current theme
 _PROBLEM_ROWS = 100           # failures listed on a result page; the rest is counted
+_REVIEW_KEYS = ["location", "kind", "size", "owner", None]     # what each column of the leftover review sorts on
+_APP_KEYS = ["name", "version", "size", None, None]            # the batch confirmation: app, version, size, how, heads-up
+_STATE_KEYS = ["name", "version", "size", None]                # the batch result rows: app, version, size, outcome
 
 
 def N_(text: str) -> str:
@@ -88,6 +93,109 @@ def size_text(size: int) -> str:
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
     return ""
+
+
+def app_size_text(app: InstalledApp) -> str:
+    """The size Windows reports for an installed app ('45.2 MB', Persian digits in Persian); '' when it reports none."""
+    return _ltr(num(format_size(app.size_kb * 1024))) if app.size_kb > 0 else ""
+
+
+class _Sort:
+    """Which column a list is sorted by, and which way. Nothing until the user clicks a header, so the list keeps the
+    order it was given; the same header again reverses it. Rows whose value is unknown (None) always go last."""
+    FIRST_DESCENDING = ("size",)    # a first click on these shows the biggest first; the others start at A
+
+    def __init__(self):
+        self.key: str | None = None
+        self.descending = False
+
+    def click(self, key: str):
+        if key == self.key:
+            self.descending = not self.descending
+        else:
+            self.set(key)
+
+    def set(self, key: str, reverse: bool = False):
+        """Sort on `key` in its usual direction, or the opposite one when `reverse`."""
+        self.key, self.descending = key, (key in self.FIRST_DESCENDING) != reverse
+
+    @property
+    def reverse(self) -> bool:
+        """Whether the list runs against the usual direction of its key: what a second click on a header does."""
+        return self.key is not None and self.descending != (self.key in self.FIRST_DESCENDING)
+
+    def apply(self, rows, values: dict[str, Callable]) -> list:
+        """`rows` in order; values[key](row) is what the column sorts on."""
+        rows = list(rows)
+        value = values.get(self.key)
+        if value is None:
+            return rows
+        known = [r for r in rows if value(r) is not None]
+        known.sort(key=value, reverse=self.descending)   # equal rows keep the order they came in
+        return known + [r for r in rows if value(r) is None]
+
+
+def _sortable(tree: QTreeWidget, keys: list[str | None], clicked: Callable[[str], None]):
+    """Clicking the header of a column with a key calls clicked(key). `keys` has one entry per column."""
+    header = tree.header()
+    header.setSectionsClickable(True)
+    header.sectionClicked.connect(lambda column: keys[column] and clicked(keys[column]))
+    for column, key in enumerate(keys):
+        if key:
+            tree.headerItem().setToolTip(column, tr("Click to sort. Click again to reverse the order."))
+
+
+def _show_sort(tree: QTreeWidget, keys: list[str | None], sort: _Sort):
+    header = tree.header()
+    shown = sort.key is not None and sort.key in keys
+    header.setSortIndicatorShown(shown)
+    if shown:
+        header.setSortIndicator(keys.index(sort.key), Qt.DescendingOrder if sort.descending else Qt.AscendingOrder)
+
+
+class _SortBar(QWidget):
+    """'Sort by' and a reverse box: what a click on a column header does, for the keyboard. It shows the sort the
+    list is in, whichever of the two set it, and sorts nothing until a key is picked."""
+    changed = Signal(str, bool)    # key, reverse
+
+    def __init__(self, keys: list[tuple[str, str]]):
+        """`keys` are (sort key, text shown)."""
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self.label = QLabel(tr("Sort by"))
+        self.combo = QComboBox()
+        self.combo.setAccessibleName(tr("Sort by"))
+        self.combo.setPlaceholderText("—")
+        for key, text in keys:
+            self.combo.addItem(text, key)
+        self.combo.setCurrentIndex(-1)
+        self.label.setBuddy(self.combo)
+        self.reverse = QCheckBox(tr("Reverse order"))
+        self.reverse.setEnabled(False)
+        row.addWidget(self.label)
+        row.addWidget(self.combo)
+        row.addWidget(self.reverse)
+        row.addStretch(1)
+        self.combo.currentIndexChanged.connect(self._emit)
+        self.reverse.toggled.connect(self._emit)
+
+    def _emit(self, *_):
+        key = self.combo.currentData()
+        if key:
+            self.reverse.setEnabled(True)
+            self.changed.emit(key, self.reverse.isChecked())
+
+    def show_sort(self, sort: _Sort):
+        """Follow the list's sort without sorting again."""
+        for widget in (self.combo, self.reverse):
+            widget.blockSignals(True)
+        self.combo.setCurrentIndex(self.combo.findData(sort.key) if sort.key else -1)
+        self.reverse.setChecked(sort.reverse)
+        self.reverse.setEnabled(self.combo.currentIndex() >= 0)
+        for widget in (self.combo, self.reverse):
+            widget.blockSignals(False)
 
 
 def registry_key(location: str) -> str:
@@ -228,7 +336,7 @@ class _Bus(QObject):
     progress = Signal(str, object)                # template, values
     finished = Signal(str, str, object, bool)     # outcome, template, values, Windows no longer lists the app
     checked = Signal(bool)
-    scan_done = Signal(object, object)            # items, the app each belongs to (None for a single app)
+    scan_done = Signal(object, object, object)    # items, the app each belongs to (None for a single app), cleanup.snapshot(items)
     scan_failed = Signal(str)
     clean_progress = Signal(str, int, object)     # template, percent (-1 unknown), values
     clean_done = Signal(object)                   # cleanup.CleanupResult
@@ -287,8 +395,11 @@ class _FlowDialog(QDialog):
         self.items: list[leftovers.Leftover] = []
         self.owners: list[str] = []       # the app each item belongs to (batch); '' for a single app
         self.result: cleanup.CleanupResult | None = None
+        self.baseline: dict = {}          # cleanup.snapshot() of the review: what its registry items held when it was made
+        self._outcome: tuple[str, str, dict] = ("", "", {})   # (outcome, English template, values) of the uninstall
         self.bus = _Bus()
         self._widths: list[int] = []
+        self._review_sort = _Sort()
         self._released = False
         self._cleaning = False            # a cleanup or an undo runs on a worker thread
         self._cleanup_token = ""
@@ -318,6 +429,11 @@ class _FlowDialog(QDialog):
     def cleanup_name(self) -> str:
         """The label the backup and the signals carry."""
         raise NotImplementedError
+
+    @property
+    def outcome(self) -> tuple[str, str, dict]:
+        """How the uninstall ended: (outcome, English template, values); ('', '', {}) while it has not ended."""
+        return self._outcome
 
     def _add_page(self, page: QWidget, width: int) -> int:
         self._widths.append(width)
@@ -390,7 +506,12 @@ class _FlowDialog(QDialog):
         self.summary.setObjectName("hint")
         self.pick_line = QLabel()
         self.pick_line.setProperty("tone", "accent")
+        names = {"location": tr("Item"), "kind": tr("Type"), "size": tr("Space used"), "owner": tr("From app")}
+        self.sort_bar = _SortBar([(k, names[k]) for k in _REVIEW_KEYS if k and (k != "owner" or self.batch)])
+        self.sort_bar.changed.connect(self._sort_review_by)
         top.addWidget(self.summary)
+        top.addStretch(1)
+        top.addWidget(self.sort_bar)
         top.addStretch(1)
         top.addWidget(self.pick_line)
         lay.addLayout(top)
@@ -417,6 +538,7 @@ class _FlowDialog(QDialog):
         self.tree.setColumnHidden(3, not self.batch)
         self.tree.itemSelectionChanged.connect(self._on_select)
         self.tree.itemChanged.connect(self._on_tick)
+        _sortable(self.tree, _REVIEW_KEYS, self._sort_review)
         lay.addWidget(self.tree, 1)
 
         self.detail_path = QLineEdit()
@@ -446,7 +568,8 @@ class _FlowDialog(QDialog):
         self.cc_size.setWordWrap(True)
         self.cc_backup_note = self._notice()
         self.cc_admin_note = self._notice("danger")
-        for w in (self.cc_title, self.cc_counts, self.cc_size, self.cc_backup_note, self.cc_admin_note):
+        self.cc_service_note = self._notice("danger")
+        for w in (self.cc_title, self.cc_counts, self.cc_size, self.cc_backup_note, self.cc_service_note, self.cc_admin_note):
             lay.addWidget(w)
         lay.addStretch(1)
         lay.addSpacing(8)
@@ -560,11 +683,12 @@ class _FlowDialog(QDialog):
         def work(bus: _Bus, job):
             try:
                 items, owners = job()
+                baseline = cleanup.snapshot(items)
             except Exception as e:
                 log.exception("leftover scan failed")
                 bus.scan_failed.emit(str(e))
                 return
-            bus.scan_done.emit(items, owners)
+            bus.scan_done.emit(items, owners, baseline)
 
         threading.Thread(target=work, args=(self.bus, self._scan_job()), daemon=True).start()
 
@@ -572,9 +696,10 @@ class _FlowDialog(QDialog):
         self.review_message.setText(tr("Looking for leftovers failed: {error}", error=error))
         self.review_stack.setCurrentIndex(2)
 
-    def _on_scan_done(self, items: list, owners: list | None = None):
+    def _on_scan_done(self, items: list, owners: list | None = None, baseline: dict | None = None):
         self.items = items
         self.owners = list(owners) if owners else [""] * len(items)
+        self.baseline = dict(baseline or {})
         if not items:
             self.review_message.setText(tr("Upstream found nothing that was left behind."))
             self.review_stack.setCurrentIndex(2)
@@ -590,7 +715,15 @@ class _FlowDialog(QDialog):
         """Only what is certain and not huge starts ticked; the user ticks the rest."""
         return item.confidence == leftovers.CERTAIN and not item.large
 
-    def _fill_tree(self):
+    def _review_values(self) -> dict:
+        """What each sortable column of the review sorts on, for a (position in self.items, leftover) pair."""
+        return {"location": lambda r: r[1].location.casefold(),
+                "kind": lambda r: tr(KIND_LABELS.get(r[1].kind, r[1].kind)).casefold(),
+                "size": lambda r: r[1].size if r[1].size is not None and r[1].kind in _PATH_KINDS else None,
+                "owner": lambda r: self.owners[r[0]].casefold() or None}
+
+    def _fill_tree(self, ticked: set[int] | None = None):
+        """The review, group by group. Positions in `ticked` start ticked (the certain, not huge ones when None)."""
         self.tree.blockSignals(True)
         self.tree.clear()
         bold = self.tree.font()
@@ -599,6 +732,7 @@ class _FlowDialog(QDialog):
             rows = [(i, it) for i, it in enumerate(self.items) if it.confidence == confidence]
             if not rows:
                 continue
+            rows = self._review_sort.apply(rows, self._review_values())
             head = QTreeWidgetItem(self.tree)
             head.setText(0, f"{tr(title)}  {num(len(rows))}")
             head.setText(4, tr(blurb))
@@ -625,12 +759,37 @@ class _FlowDialog(QDialog):
                         row.setData(col, _ROW_ROLE, "protected")
                 else:
                     row.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-                    row.setCheckState(0, Qt.Checked if self.preticked(it) else Qt.Unchecked)
+                    row.setCheckState(0, Qt.Checked if (self.preticked(it) if ticked is None else index in ticked)
+                                      else Qt.Unchecked)
             if confidence in _TICKABLE_GROUPS:
                 head.setCheckState(0, self._group_state(head))
         self.tree.expandAll()
         self.tree.blockSignals(False)
+        _show_sort(self.tree, _REVIEW_KEYS, self._review_sort)
+        self.sort_bar.show_sort(self._review_sort)
         self._update_pick()
+
+    def _sort_review(self, key: str):
+        """A header was clicked."""
+        self._review_sort.click(key)
+        self._resort_review()
+
+    def _sort_review_by(self, key: str, reverse: bool):
+        """The Sort by box was used."""
+        self._review_sort.set(key, reverse)
+        self._resort_review()
+
+    def _resort_review(self):
+        """The rows of each group are put in the new order; what is ticked and selected stays."""
+        ticked = {row.data(0, Qt.UserRole) for row in self._ticked_rows()}
+        chosen = [row.data(0, Qt.UserRole) for row in self.tree.selectedItems()]
+        self._fill_tree(ticked)
+        for g in range(self.tree.topLevelItemCount()):
+            head = self.tree.topLevelItem(g)
+            for i in range(head.childCount()):
+                if chosen and head.child(i).data(0, Qt.UserRole) == chosen[0]:
+                    self.tree.setCurrentItem(head.child(i))
+        self._on_select()
 
     @staticmethod
     def _group_state(head: QTreeWidgetItem):
@@ -640,16 +799,17 @@ class _FlowDialog(QDialog):
     def _on_tick(self, *_):
         self._update_pick()
 
-    def ticked(self) -> list[leftovers.Leftover]:
-        """The leftovers the user has ticked (protected ones have no box)."""
-        found = []
+    def _ticked_rows(self):
         for g in range(self.tree.topLevelItemCount()):
             head = self.tree.topLevelItem(g)
             for i in range(head.childCount()):
                 row = head.child(i)
                 if row.flags() & Qt.ItemIsUserCheckable and row.checkState(0) == Qt.Checked:
-                    found.append(self.items[row.data(0, Qt.UserRole)])
-        return found
+                    yield row
+
+    def ticked(self) -> list[leftovers.Leftover]:
+        """The leftovers the user has ticked (protected ones have no box)."""
+        return [self.items[row.data(0, Qt.UserRole)] for row in self._ticked_rows()]
 
     def _update_pick(self):
         picked = self.ticked()
@@ -751,11 +911,15 @@ class _FlowDialog(QDialog):
             tr("Each item is backed up first. You can undo this right after, or later from Backups."))
         admin = 0 if cleanup.is_admin() else sum(1 for it in picked if cleanup.needs_admin(it))
         self.cc_admin_note.label.setText(
-            trn("{n} item may need administrator rights. Upstream never raises its own rights, so if it can't remove "
-                "it, it is left alone. Start Upstream as administrator to remove it.",
-                "{n} items may need administrator rights. Upstream never raises its own rights, so if it can't remove "
-                "them, they are left alone. Start Upstream as administrator to remove them.", admin))
+            trn("{n} item may need administrator rights. Upstream never gives itself administrator rights, so if it "
+                "can't remove it, it is left alone. Start Upstream as administrator to remove it.",
+                "{n} items may need administrator rights. Upstream never gives itself administrator rights, so if it "
+                "can't remove them, they are left alone. Start Upstream as administrator to remove them.", admin))
         self.cc_admin_note.setVisible(bool(admin))
+        service = any(it.kind == "service" for it in picked)
+        self.cc_service_note.label.setText(
+            tr("Undo can't bring a removed service back. To get one back, reinstall the app.") if service else "")
+        self.cc_service_note.setVisible(service)
         self._show(self.p_clean_confirm)
 
     def _start_cleanup(self):
@@ -770,16 +934,16 @@ class _FlowDialog(QDialog):
         log.info("%s: removing %d ticked leftovers", self.cleanup_name, len(picked))
         self._show(self.p_cleaning)
         point = None if self.settings is None else bool(self.settings.get("cleanup_restore_point", False))
-        threading.Thread(target=self._clean_work, args=(self.bus, picked, self.cleanup_name, self._stop, point),
+        threading.Thread(target=self._clean_work, args=(self.bus, picked, self.cleanup_name, self._stop, point, self.baseline),
                          daemon=True).start()
 
     @staticmethod
-    def _clean_work(bus: _Bus, items, name: str, stop: threading.Event, point: bool | None):
+    def _clean_work(bus: _Bus, items, name: str, stop: threading.Event, point: bool | None, baseline: dict):
         def progress(template, percent=-1, **values):
             bus.clean_progress.emit(template, percent, values)
 
         try:
-            result = cleanup.run(items, name, progress, stop, restore_point=point)
+            result = cleanup.run(items, name, progress, stop, restore_point=point, baseline=baseline)
         except Exception as e:
             log.exception("cleanup of %s failed", name)
             result = cleanup.CleanupResult(failed=[(it, "{error}", {"error": str(e)}) for it in items])
@@ -789,10 +953,17 @@ class _FlowDialog(QDialog):
         self._cleaning = True
         self._cleanup_token = f"cleanup:{id(self)}"
         _RUNNING.add(self._cleanup_token)
+        self._set_backups_enabled(False)
 
     def _end_work(self):
         self._cleaning = False
         _RUNNING.discard(self._cleanup_token)
+        self._set_backups_enabled(True)
+
+    def _set_backups_enabled(self, enabled: bool):
+        """The Backups dialog restores and deletes: it stays closed while this dialog's cleanup or undo runs."""
+        for button in (self.backups_btn, self.sum_backups_btn):
+            button.setEnabled(enabled)
 
     def _stop_cleanup(self):
         self._stop.set()
@@ -901,6 +1072,8 @@ class _FlowDialog(QDialog):
         self._fit()
 
     def _open_backups(self):
+        if self._cleaning:
+            return
         dialog = BackupsDialog(self, settings=self.settings)
         dialog.restored.connect(self.restored)
         dialog.exec()
@@ -929,7 +1102,6 @@ class UninstallDialog(_FlowDialog):
         self._checking = False    # "Check again" is waiting for Windows; its answer must still reach the window
         self._want_scan = False
         self._silent_used = False
-        self._outcome: tuple[str, str, dict] = ("", "", {})
         self._wait_shown = ""     # the reason Uninstall is held back, as the confirm page last showed it
         self._icon = icon if icon is not None and not icon.isNull() else letter_avatar(self.app.name)
         self._poll = QTimer(self)   # updates and other uninstalls end while the confirm page is open
@@ -966,6 +1138,8 @@ class UninstallDialog(_FlowDialog):
         names = QVBoxLayout()
         names.setSpacing(2)
         meta = [tr("Version {version}", version=self.app.version)] if self.app.version else []
+        if self.app.size_kb > 0:
+            meta.append(app_size_text(self.app))
         meta.append(isolate(self.app.publisher or tr("Unknown publisher")))   # keeps the full stop of "Figma, Inc." in an RTL line
         title = ElidedLabel(self.app.name, "dlgTitle")
         title.ensurePolished()   # its font comes from the stylesheet, and the size hint needs it
@@ -1272,6 +1446,7 @@ class _Job:
         self.status, self.app = status, status.app
         self.plans = {quiet: uninstaller.plan(self.app, status.winget_id, prefer_silent=quiet) for quiet in (True, False)}
         self.outcome = "waiting"
+        self.template, self.values = "", {}   # what the uninstaller said, English template and values
         self.gone = False
 
     def plan(self, quiet: bool) -> uninstaller.UninstallPlan:
@@ -1305,13 +1480,15 @@ class BatchUninstallDialog(_FlowDialog):
         self._stop_batch = threading.Event()
         self._finished = 0
         self._order: list[int] = []
+        self._sort = _Sort()                          # the order the apps are listed in; the run order is not affected
+        self._rows: dict[int, QTreeWidgetItem] = {}   # job -> its row on the result page
         self._poll = QTimer(self)
         self._poll.setInterval(1000)
         self._poll.timeout.connect(self._poll_wait)
 
         self.setWindowTitle(trn("Uninstall {n} app", "Uninstall {n} apps", len(self.jobs)))
-        self._add_page(self._build_confirm(), 740)
-        self._add_page(self._build_running(), 740)
+        self._add_page(self._build_confirm(), 860)
+        self._add_page(self._build_running(), 860)
         self._add_cleanup_pages()
         self.bus.progress.connect(self._on_progress)
         self.bus.app_state.connect(self._on_app_state)
@@ -1343,26 +1520,32 @@ class BatchUninstallDialog(_FlowDialog):
         self.bc_title = QLabel(trn("Uninstall {n} app?", "Uninstall {n} apps?", len(self.jobs)))
         self.bc_title.setObjectName("dlgTitle")
         self.bc_title.setWordWrap(True)
+        self.bc_total = QLabel()
+        self.bc_total.setWordWrap(True)
+        self.bc_total.setProperty("tone", "accent")
         self.bc_sub = QLabel()
         self.bc_sub.setWordWrap(True)
         self.bc_sub.setObjectName("hint")
         self.wait_notice = self._notice()
         self.apps_tree = QTreeWidget()
-        self.apps_tree.setColumnCount(3)
-        self.apps_tree.setHeaderLabels([tr("Application"), tr("How it will be removed"), tr("Heads-up")])
+        self.apps_tree.setColumnCount(5)
+        self.apps_tree.setHeaderLabels([tr("Application"), tr("Version"), tr("Size"), tr("How it will be removed"),
+                                        tr("Heads-up")])
         self.apps_tree.setRootIsDecorated(False)
         self.apps_tree.setIndentation(0)
         self.apps_tree.setUniformRowHeights(True)
         self.apps_tree.setSelectionMode(QTreeWidget.NoSelection)
         self.apps_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.apps_tree.setItemDelegate(_Delegate(self.apps_tree))
-        self.apps_tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
-        self.apps_tree.header().setSectionResizeMode(1, QHeaderView.Interactive)
+        for column in range(4):
+            self.apps_tree.header().setSectionResizeMode(column, QHeaderView.Interactive)
         self.apps_tree.header().setStretchLastSection(True)
-        self.apps_tree.setColumnWidth(0, 250)
-        self.apps_tree.setColumnWidth(1, 210)
+        for column, width in enumerate((220, 90, 90, 190)):
+            self.apps_tree.setColumnWidth(column, width)
         self.apps_tree.setMinimumHeight(200)
         self.apps_tree.setMaximumHeight(300)
+        _sortable(self.apps_tree, _APP_KEYS, self._sort_apps)
+        self.apps_sort_bar = self._app_sort_bar()
         self.ack_box = QCheckBox(tr("I understand that other apps or devices may stop working"))
         self.ack_box.toggled.connect(self._refresh_confirm)
         self.quiet_box = QCheckBox(tr("Run quietly when possible"))
@@ -1374,7 +1557,8 @@ class BatchUninstallDialog(_FlowDialog):
                                        "until you choose it, and everything removed is backed up first."))
         self.leftover_hint.setObjectName("hint")
         self.leftover_hint.setWordWrap(True)
-        for w in (self.bc_title, self.bc_sub, self.wait_notice, self.apps_tree, self.ack_box):
+        for w in (self.bc_title, self.bc_total, self.bc_sub, self.wait_notice, self.apps_sort_bar, self.apps_tree,
+                  self.ack_box):
             lay.addWidget(w)
         lay.addSpacing(6)
         lay.addWidget(self.quiet_box)
@@ -1403,24 +1587,28 @@ class BatchUninstallDialog(_FlowDialog):
         self.b_bar.setFixedHeight(4)
         self.b_bar.setTextVisible(False)
         self.state_tree = QTreeWidget()
-        self.state_tree.setColumnCount(2)
-        self.state_tree.setHeaderLabels([tr("Application"), tr("Outcome")])
+        self.state_tree.setColumnCount(4)
+        self.state_tree.setHeaderLabels([tr("Application"), tr("Version"), tr("Size"), tr("Outcome")])
         self.state_tree.setRootIsDecorated(False)
         self.state_tree.setIndentation(0)
         self.state_tree.setUniformRowHeights(True)
         self.state_tree.setSelectionMode(QTreeWidget.NoSelection)
         self.state_tree.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.state_tree.setItemDelegate(_Delegate(self.state_tree))
-        self.state_tree.header().setSectionResizeMode(0, QHeaderView.Interactive)
+        for column in range(3):
+            self.state_tree.header().setSectionResizeMode(column, QHeaderView.Interactive)
         self.state_tree.header().setStretchLastSection(True)
-        self.state_tree.setColumnWidth(0, 260)
+        for column, width in enumerate((250, 90, 90)):
+            self.state_tree.setColumnWidth(column, width)
         self.state_tree.setMinimumHeight(200)
         self.state_tree.setMaximumHeight(320)
+        _sortable(self.state_tree, _STATE_KEYS, self._sort_apps)
+        self.state_sort_bar = self._app_sort_bar()
         self.run_hint = QLabel(tr("Finish the steps in an uninstaller's own window when one opens. Windows may ask "
                                   "for permission."))
         self.run_hint.setObjectName("hint")
         self.run_hint.setWordWrap(True)
-        for w in (self.run_title, self.step, self.b_bar, self.state_tree, self.run_hint):
+        for w in (self.run_title, self.step, self.b_bar, self.state_sort_bar, self.state_tree, self.run_hint):
             lay.addWidget(w)
         lay.addStretch(1)
         buttons = QHBoxLayout()
@@ -1441,24 +1629,66 @@ class BatchUninstallDialog(_FlowDialog):
         else:
             self._poll.stop()
 
+    def _shown(self) -> list[int]:
+        """Positions in self.jobs in the order the lists show them: as given until a header is clicked."""
+        values = {"name": lambda i: self.jobs[i].app.name.casefold(),
+                  "version": lambda i: parse_version(self.jobs[i].app.version),
+                  "size": lambda i: self.jobs[i].app.size_kb or None}
+        return self._sort.apply(range(len(self.jobs)), values)
+
+    def _app_cells(self, row: QTreeWidgetItem, job: _Job):
+        """Name, version and size: the first three columns of both lists."""
+        app = job.app
+        row.setText(0, isolate(app.name))
+        row.setToolTip(0, row.text(0))
+        row.setText(1, _ltr(app.version))
+        row.setText(2, app_size_text(app))
+        row.setTextAlignment(2, Qt.AlignTrailing | Qt.AlignVCenter)
+
+    def _app_sort_bar(self) -> _SortBar:
+        bar = _SortBar([("name", tr("Name")), ("version", tr("Version")), ("size", tr("Size"))])
+        bar.changed.connect(self._sort_apps_by)
+        return bar
+
+    def _sort_apps(self, key: str):
+        """A header was clicked."""
+        self._sort.click(key)
+        self._resort_apps()
+
+    def _sort_apps_by(self, key: str, reverse: bool):
+        """A Sort by box was used."""
+        self._sort.set(key, reverse)
+        self._resort_apps()
+
+    def _resort_apps(self):
+        self._fill_apps()
+        if self._rows:
+            self.state_tree.invisibleRootItem().takeChildren()
+            for i in self._shown():
+                self.state_tree.addTopLevelItem(self._rows[i])
+        for tree, keys in ((self.apps_tree, _APP_KEYS), (self.state_tree, _STATE_KEYS)):
+            _show_sort(tree, keys, self._sort)
+        for bar in (self.apps_sort_bar, self.state_sort_bar):
+            bar.show_sort(self._sort)
+
     def _fill_apps(self):
         quiet = self._quiet()
         self.apps_tree.clear()
-        for job in self.jobs:
+        for i in self._shown():
+            job = self.jobs[i]
             plan = job.plan(quiet)
             row = QTreeWidgetItem(self.apps_tree)
-            version = f" {job.app.version}" if job.app.version else ""
-            row.setText(0, isolate(f"{job.app.name}{version}"))
-            row.setToolTip(0, row.text(0))
+            self._app_cells(row, job)
             if plan.blocked:
-                row.setText(1, tr("Can't be removed here"))
-                row.setText(2, render(plan.blocked, plan.blocked_values))
-                for col in range(3):
+                row.setText(3, tr("Can't be removed here"))
+                row.setText(4, render(plan.blocked, plan.blocked_values))
+                for col in range(5):
                     row.setData(col, _ROW_ROLE, "protected")
             else:
-                row.setText(1, _how(plan))
-                row.setText(2, " ".join(render(t, v) for t, v in plan.notes))
-            row.setToolTip(2, row.text(2))
+                row.setText(3, _how(plan))
+                row.setText(4, " ".join(render(t, v) for t, v in plan.notes))
+            row.setToolTip(3, row.text(3))
+            row.setToolTip(4, row.text(4))
 
     def _acks(self) -> bool:
         return any(not j.plan(self._quiet()).blocked and uninstaller.needs_ack(j.plan(self._quiet())) for j in self.jobs)
@@ -1469,6 +1699,8 @@ class BatchUninstallDialog(_FlowDialog):
         runnable = [j for j in self.jobs if not j.plan(quiet).blocked]
         skipped = len(self.jobs) - len(runnable)
         self.bc_title.setText(trn("Uninstall {n} app?", "Uninstall {n} apps?", len(runnable)))
+        self.bc_total.setText(self._total_text(runnable))
+        self.bc_total.setVisible(bool(self.bc_total.text()))
         sub = tr("They are removed one after another. Apps that open their own window go first.")
         if skipped:
             sub += " " + trn("{n} app can't be removed here and is skipped.", "{n} apps can't be removed here and are skipped.",
@@ -1482,6 +1714,20 @@ class BatchUninstallDialog(_FlowDialog):
         self.go_btn.setEnabled(bool(runnable) and not wait and not self._needs_ack())
         if self.stack.currentIndex() == BATCH_CONFIRM:
             self._fit()
+
+    @staticmethod
+    def _total_text(runnable: list[_Job]) -> str:
+        """'3 apps, about 1.2 GB to free', plus a word about the apps Windows reports no size for; '' when none does."""
+        total = sum(j.app.size_kb for j in runnable)
+        if total <= 0:
+            return ""
+        text = trn("{n} app, about {size} to free", "{n} apps, about {size} to free", len(runnable),
+                   size=num(format_size(total * 1024)))
+        unknown = sum(1 for j in runnable if j.app.size_kb <= 0)
+        if unknown:
+            text += " · " + trn("{n} app has no reported size and isn't counted.",
+                              "{n} apps have no reported size and aren't counted.", unknown)
+        return text
 
     @property
     def updates_running(self) -> bool:
@@ -1517,11 +1763,11 @@ class BatchUninstallDialog(_FlowDialog):
         self._order = sorted(runnable, key=lambda i: self.jobs[i].plan(quiet).silent)
         plans = [(i, self.jobs[i].plan(quiet)) for i in self._order]
         self.state_tree.clear()
-        self._rows: dict[int, QTreeWidgetItem] = {}
-        for i, job in enumerate(self.jobs):
+        self._rows = {}
+        for i in self._shown():
+            job = self.jobs[i]
             row = QTreeWidgetItem(self.state_tree)
-            row.setText(0, isolate(job.app.name))
-            row.setToolTip(0, row.text(0))
+            self._app_cells(row, job)
             self._rows[i] = row
             if i in runnable:
                 self._set_row(i, "waiting")
@@ -1570,9 +1816,9 @@ class BatchUninstallDialog(_FlowDialog):
         title, tone = RESULT_TITLES.get(outcome, RESULT_TITLES["failed"])
         text = tr(title) + (f": {detail}" if detail else "")
         row = self._rows[index]
-        row.setText(1, text)
-        row.setToolTip(1, text)
-        row.setData(1, _ROW_ROLE, "protected" if outcome in ("waiting", "skipped", "cancelled") else None)
+        row.setText(3, text)
+        row.setToolTip(3, text)
+        row.setData(3, _ROW_ROLE, "protected" if outcome in ("waiting", "skipped", "cancelled") else None)
 
     def _on_progress(self, template: str, values: dict):
         self.step.setText(render(template, values))
@@ -1584,7 +1830,7 @@ class BatchUninstallDialog(_FlowDialog):
             self._set_row(index, "running")
             self.state_tree.scrollToItem(self._rows[index])
             return
-        job.outcome = outcome
+        job.outcome, job.template, job.values = outcome, template, values
         detail = render(template, values) if outcome != "removed" and template else ""
         self._set_row(index, outcome, detail)
         if outcome != "skipped":
@@ -1604,9 +1850,19 @@ class BatchUninstallDialog(_FlowDialog):
         self.b_stop.setEnabled(False)
         self.step.setText(tr("Stopping after the one in progress…"))
 
+    def _batch_outcome(self) -> tuple[str, str, dict]:
+        """'removed' when every app that was tried is gone, else how the first one that stayed ended (one that
+        never ran last). An app that can't be removed here is not counted: it was never tried."""
+        left = [j for j in self.jobs if not j.gone and (j.outcome != "skipped" or j.template)]
+        if not left:
+            return "removed", "", {}
+        job = next((j for j in left if j.outcome not in ("waiting", "skipped")), left[0])
+        return job.outcome, job.template, job.values
+
     def _on_batch_done(self):
         self._busy = False
         _RUNNING.discard(self._token)
+        self._outcome = self._batch_outcome()
         if self._released:
             self.deleteLater()
             return
@@ -1686,6 +1942,7 @@ class BackupsDialog(QDialog):
         self._working = False
         self._token = f"restore:{id(self)}"
         self.backups: list[cleanup.Backup] = []
+        self._doomed: cleanup.Backup | None = None    # the backup the open confirmation asks about
         self.setWindowTitle(tr("Backups"))
         self.setMinimumWidth(680)
         lay = QVBoxLayout(self)
@@ -1715,7 +1972,7 @@ class BackupsDialog(QDialog):
         self.tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.tree.header().setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tree.itemSelectionChanged.connect(self._update_buttons)
+        self.tree.itemSelectionChanged.connect(self._on_selection)
         self.empty = QLabel(tr("No backups yet."))
         self.empty.setAlignment(Qt.AlignCenter)
         self.empty.setObjectName("hint")
@@ -1735,11 +1992,11 @@ class BackupsDialog(QDialog):
         self.confirm.setProperty("tone", "danger")
         row = QHBoxLayout(self.confirm)
         row.setContentsMargins(12, 9, 12, 9)
-        question = QLabel(tr("Delete this backup for good? Then it can no longer be restored."))
-        question.setWordWrap(True)
+        self.question = QLabel()
+        self.question.setWordWrap(True)
         self.confirm_yes = _button(tr("Delete for good"), "danger", self._delete_confirmed)
         self.confirm_no = _button(tr("Keep backup"), "", self._keep)
-        row.addWidget(question, 1)
+        row.addWidget(self.question, 1)
         row.addWidget(self.confirm_yes)
         row.addWidget(self.confirm_no)
         for w in (self.status, self.problems_title, self.problems, self.bar, self.confirm):
@@ -1781,6 +2038,15 @@ class BackupsDialog(QDialog):
         wanted = picked[0].data(0, Qt.UserRole) if picked else None
         return next((b for b in self.backups if b.id == wanted), None)
 
+    def _on_selection(self):
+        if self._doomed is not None:    # another row was picked: the question was about the old one
+            self._close_confirmation()
+        self._update_buttons()
+
+    def _close_confirmation(self):
+        self._doomed = None
+        self.confirm.hide()
+
     def _update_buttons(self):
         ready = self.selected() is not None and not self._working
         self.restore_btn.setEnabled(ready)
@@ -1793,15 +2059,20 @@ class BackupsDialog(QDialog):
         self._working = True
         _RUNNING.add(self._token)
         self._name = backup.app_name
-        self.confirm.hide()
+        self._close_confirmation()
         self.problems_title.hide()
         self.problems.hide()
-        self.status.setText(tr("Restoring…"))
-        self.status.show()
+        self._say(tr("Restoring…"))
         self.bar.setRange(0, 0)
         self.bar.show()
         self._update_buttons()
         threading.Thread(target=_restore_work, args=(self.bus, backup.id), daemon=True).start()
+
+    def _say(self, text: str, tone: str = "accent"):
+        self.status.setText(text)
+        self.status.setProperty("tone", tone)
+        theme.repolish(self.status)
+        self.status.show()
 
     def _on_progress(self, template: str, percent: int, values: dict):
         self.status.setText(render(template, values))
@@ -1813,7 +2084,7 @@ class BackupsDialog(QDialog):
         self._working = False
         _RUNNING.discard(self._token)
         self.bar.hide()
-        self.status.setText(_restore_summary(result))
+        self._say(_restore_summary(result))
         self.problems_title.setVisible(bool(result.failed))
         self.problems.setVisible(bool(result.failed))
         _fill_problems(self.problems, result.failed)
@@ -1821,24 +2092,31 @@ class BackupsDialog(QDialog):
         self.refresh()
 
     def _keep(self):
-        self.confirm.hide()
+        self._close_confirmation()
         self._update_buttons()
 
     def _delete(self):
-        if self.selected() is None or self._working:
+        backup = self.selected()
+        if backup is None or self._working:
             return
+        self._doomed = backup
+        self.question.setText(tr("Delete the backup of {app} from {date} for good? Then it can no longer be restored.",
+                                 app=isolate(backup.app_name), date=when_text(backup.ts)))
         self.confirm.show()
         self._update_buttons()
 
     def _delete_confirmed(self):
-        backup = self.selected()
+        backup, self._doomed = self._doomed, None    # what was asked about, not whatever is selected now
         self.confirm.hide()
-        if backup is not None and not self._working:
-            cleanup.delete_backup(backup.id)
-            self.status.setText(tr("Backup deleted."))
-            self.status.show()
-            self.problems_title.hide()
-            self.problems.hide()
+        if backup is None or self._working:
+            self._update_buttons()
+            return
+        deleted = cleanup.delete_backup(backup.id)
+        self._say(tr("Backup deleted.") if deleted else
+                  tr("Couldn't delete this backup. A cleanup or an undo may be running, or it was made while "
+                     "Upstream ran as administrator."), "accent" if deleted else "danger")
+        self.problems_title.hide()
+        self.problems.hide()
         self.refresh()
 
     def reject(self):

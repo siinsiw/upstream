@@ -416,6 +416,31 @@ def _close_fault_file() -> None:
         pass
 
 
+def exit_now(code: int) -> None:
+    """Leave the process without interpreter finalisation. Worker threads (daemon) may still be inside a Qt call
+    or about to emit a signal when a normal shutdown tears Qt down, which aborts the process; the next start would
+    report that as a crash. Everything that must be saved was saved by then (the aboutToQuit handlers)."""
+    _close_fault_file()
+    try:
+        logging.shutdown()
+        for stream in (sys.stdout, sys.stderr):
+            if stream is not None:
+                stream.flush()
+    except (OSError, ValueError):
+        pass
+    _flush_clipboard()
+    os._exit(int(code))
+
+
+def _flush_clipboard() -> None:
+    """Qt hands text copied from Upstream to Windows lazily (OLE delayed rendering) and renders it in its own
+    teardown, which os._exit skips: without this the report or command the user just copied is empty after quit."""
+    try:
+        ctypes.windll.ole32.OleFlushClipboard()
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
 def _enable_faulthandler() -> None:
     """Hard crashes (an access violation inside Qt, a fatal Python error) write their stack into this
     process's own file; the next start turns a non-empty one into a report."""

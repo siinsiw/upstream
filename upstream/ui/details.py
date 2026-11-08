@@ -106,7 +106,7 @@ class DetailsDialog(QDialog):
         self._build_shell()
         self.retranslate()
         self._fit()
-        QTimer.singleShot(0, self.start_background)
+        QTimer.singleShot(0, self, self.start_background)    # the dialog is the context: deleted first, it never starts
 
     # -- building ------------------------------------------------------
     @staticmethod

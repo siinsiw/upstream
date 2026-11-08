@@ -341,7 +341,7 @@ class BusyRetryTest(unittest.TestCase):
             mock.patch.object(updater.installer, "signature", lambda p: ("Valid", "Demo Inc")),
             mock.patch.object(updater.installer, "detect", lambda p, h=None: "msi"),
             mock.patch.object(updater.installer, "install", install),
-            mock.patch.object(updater.trust, "evaluate", lambda *a: mock.Mock(action="allow")),
+            mock.patch.object(updater.trust, "evaluate", lambda *a, **k: mock.Mock(action="allow")),
             mock.patch.object(updater.inplace, "plan", lambda *a: plan),
             mock.patch.object(updater.running, "close_for_update"),
             mock.patch.object(updater.verify, "snapshot"),

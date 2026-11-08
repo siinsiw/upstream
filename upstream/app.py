@@ -11,18 +11,20 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication
 
-from . import __version__, installer, net, stability
+from . import __version__, cleanup, history, installer, net, stability
+from .background import Background
 from .config import Cache, Settings, migrate_legacy, setup_logging
 from .i18n import LANGUAGES
 from .ui.crash import CrashReportDialog
 from .ui.locale import apply_language
 from .ui.theme import THEMES, app_icon, apply_theme
-from .ui.window import MainWindow
+from .ui.window import TABS, MainWindow
 
 log = logging.getLogger("upstream.app")
 
 CRASH_REPORT_DELAY_MS = 400
 HOUSEKEEPING_DELAY_MS = 5000
+BACKUP_PURGE_DELAY_MS = 8000
 
 
 @dataclass(frozen=True)
@@ -70,9 +72,11 @@ def _clean_settings(settings: Settings):
     timeout = settings.get("install_timeout_min")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
         settings.set("install_timeout_min", 30)
-    for key in ("signers", "signers_approved"):
-        if not isinstance(settings.get(key), dict):
-            settings.set(key, {})
+    for key, kind in (("signers", dict), ("signers_approved", dict), ("pins", dict), ("auto_update", list)):
+        if not isinstance(settings.get(key), kind):
+            settings.set(key, kind())
+    if settings.get("last_tab") not in TABS:
+        settings.set("last_tab", "updates")
 
 
 def _show_window(window: MainWindow, settings: Settings, launch: Launch) -> None:
@@ -97,6 +101,21 @@ def _show_crash_report(window: MainWindow) -> None:
 
 def _start_housekeeping() -> None:
     threading.Thread(target=stability.housekeeping, name="housekeeping", daemon=True).start()
+
+
+def _purge_old_backups(settings: Settings) -> None:
+    """Delete leftover-cleanup backups past `cleanup_backup_days`, off the UI thread; never raises."""
+    def work():
+        days = settings.get("cleanup_backup_days", 30)
+        try:
+            if isinstance(days, int) and not isinstance(days, bool):
+                removed = cleanup.purge_old(days)
+                if removed:
+                    log.info("Deleted %d cleanup backup(s) older than %d days", removed, days)
+        except Exception:
+            log.exception("Could not delete old cleanup backups")
+
+    threading.Thread(target=work, name="backup-purge", daemon=True).start()
 
 
 def main() -> int:
@@ -131,6 +150,8 @@ def main() -> int:
     _clean_settings(settings)
     net.configure(settings)
     installer.configure(settings)
+    history.configure(settings)
+    cleanup.configure(settings)
 
     app.setApplicationName("Upstream")
     app.setApplicationDisplayName("Upstream")
@@ -144,11 +165,19 @@ def main() -> int:
     except AttributeError:
         pass
 
-    window = MainWindow(settings, Cache())
-    # Background (tray, schedule, automatic updates) is created here once it is wired in. If its tray icon
-    # cannot be made, a --minimized start must show the window.
+    window = MainWindow(settings, Cache(), persist=True)
+    try:
+        window.show_last_scan()     # the last result at once; the check below brings it up to date
+    except Exception:
+        log.exception("Could not show the last check")      # a damaged file must never keep the window from opening
+    # Tray, schedule and automatic updates. With no tray icon a --minimized start opens the window minimized.
+    window.background = background = Background(window, settings)
+    background.start(minimized=launch.minimized)
+    app.aboutToQuit.connect(background.stop)
+    app.aboutToQuit.connect(window.shutdown)
     _show_window(window, settings, launch)
     QTimer.singleShot(150, window.start_scan)
     QTimer.singleShot(CRASH_REPORT_DELAY_MS, lambda: _show_crash_report(window))
     QTimer.singleShot(HOUSEKEEPING_DELAY_MS, _start_housekeeping)
+    QTimer.singleShot(BACKUP_PURGE_DELAY_MS, lambda: _purge_old_backups(settings))
     return app.exec()

@@ -99,6 +99,11 @@ class NotesTest(QuietCase):
         ("Not only bug fixes: also a security patch.", [], True),
         ("Fixed a bug. Security fixes are included.", [], True),
         ("Security-fix for the zip extractor", [], True),
+        ("No new features, security fixes and bug fixes only.", [], True),
+        ("Nothing else changed, security updates included", [], True),
+        ("- [x] Security fix", [], True),
+        ("- [ ] Docs\n- [x] Security fix", [], True),
+        ("Fixed a vulnerability. Fix vulnerability scanner false positives.", [], True),
     ]
     NOTHING = [
         "No security fixes in this release.",
@@ -117,6 +122,13 @@ class NotesTest(QuietCase):
         "Not affected by CVE-2024-1234.",
         "This does not fix CVE-2024-1234.",
         "Fixed crash on startup. Improved performance.",
+        "Fix vulnerability scanner false positives",
+        "Fewer false positives in the vulnerability check",
+        "Improved Windows security updates notification",
+        "New security update settings page",
+        "- [ ] Security fix",
+        "## Type of change\n- [ ] Bug fix\n- [ ] Security fix (CVE-2024-1234)\n* [ ] Breaking change",
+        "1. [ ] Security patch",
         PLAIN_GITHUB_NOTES,
         "",
     ]
@@ -131,6 +143,15 @@ class NotesTest(QuietCase):
             with self.subTest(text=text):
                 self.assertEqual(badges._scan_notes(text), ([], False))
                 self.assertEqual(badges.compute(release(text)), [])
+
+    def test_a_negation_stops_at_a_comma(self):
+        self.assertEqual(badges._scan_notes("No new features, security fixes and bug fixes only."), ([], True))
+        self.assertEqual(badges._scan_notes("Not much changed, vulnerabilities were fixed."), ([], True))
+        self.assertEqual(badges._scan_notes("No security fixes in this release, only bug fixes."), ([], False))
+
+    def test_a_ticked_task_line_counts_and_an_unticked_one_does_not(self):
+        notes = "- [x] Security fix\n- [ ] Security patch (CVE-2024-9999)"
+        self.assertEqual(badges._scan_notes(notes), ([], True))
 
     def test_a_negation_stops_at_the_end_of_the_sentence(self):
         self.assertEqual(badges._scan_notes("There is no changelog. Security fixes inside."), ([], True))
@@ -468,11 +489,11 @@ class RollingProductTest(QuietCase):
 
 
 class OutdatedTest(QuietCase):
-    def kinds(self, installed, offered, name="Demo App", **kw):
+    def kinds(self, installed, offered, name="Node.js", **kw):
         return [b.kind for b in badges.compute(make_status(name, installed, offered=offered, **kw), today=TODAY)]
 
     def test_two_or_more_majors_behind(self):
-        [badge] = badges.compute(make_status(version="1.9.2", offered="3.0.1"), today=TODAY)
+        [badge] = badges.compute(make_status("Node.js", "1.9.2", offered="3.0.1"), today=TODAY)
         self.assertEqual((badge.kind, badge.text), ("outdated", "Outdated"))
         self.assertEqual(badge.values, {"installed": "1.9.2", "latest": "3.0.1"})
         self.assertEqual(i18n.render(badge.tooltip, badge.values),
@@ -510,6 +531,15 @@ class OutdatedTest(QuietCase):
 
     def test_no_update_means_no_badge(self):
         self.assertEqual(badges.compute(make_status(version="1.0"), today=TODAY), [])
+
+    def test_apps_outside_the_product_table_are_never_outdated(self):
+        # Version numbers of other apps are years, marketing numbers or builds, not majors.
+        for name, installed, offered in [("Microsoft Edge", "140.0.3485.54", "142.0.3595.3"),
+                                         ("Mozilla Thunderbird (x64 en-US)", "128.0", "140.0"),
+                                         ("7-Zip 24.09 (x64)", "24.09", "26.06"), ("Demo App", "1.0", "5.0")]:
+            with self.subTest(name):
+                self.assertEqual(self.kinds(installed, offered, name=name), [])
+        self.assertEqual(self.kinds("18.17.0", "22.1.0", name="Node.js"), ["outdated"])
 
     def test_browsers_count_releases_not_majors(self):
         self.assertEqual(self.kinds("120.0", "125.0", name="Mozilla Firefox (x64 en-US)"), [])
@@ -643,6 +673,8 @@ class RefreshTest(QuietCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.cache = FakeCache()
+        badges._failed_until.clear()
+        self.addCleanup(badges._failed_until.clear)
         self.server.table("python", PYTHON_API)
         self.server.table("nodejs", NODE_API)
 
@@ -715,9 +747,33 @@ class RefreshTest(QuietCase):
             badges.refresh_eol(self.cache, self.apps("Python 3.8.10 (64-bit)", "Node.js", "PHP 8.3.4"))
         self.assertEqual(opened.call_count, 1)
         self.assertEqual(self.cache.data["eol"], {})
+        badges._failed_until.clear()
         with mock.patch.object(badges.net, "urlopen", side_effect=TimeoutError("slow")) as opened:
             badges.refresh_eol(self.cache, self.apps("Python 3.8.10 (64-bit)", "Node.js"))
         self.assertEqual(opened.call_count, 1)
+
+    def test_a_blocked_network_is_not_asked_again_for_an_hour(self):
+        statuses = self.apps("Python 3.8.10 (64-bit)", "Node.js")
+        now = time.time()
+        with mock.patch.object(badges.net, "urlopen", side_effect=urllib.error.URLError("blocked")) as opened:
+            badges.refresh_eol(self.cache, statuses, now)
+            badges.refresh_eol(self.cache, statuses, now + 60)               # the next scan, a minute later
+            badges.refresh_eol(self.cache, statuses, now + badges.FAILURE_BACKOFF - 1)
+        self.assertEqual(opened.call_count, 1)
+        badges.refresh_eol(self.cache, statuses, now + badges.FAILURE_BACKOFF + 1)
+        self.assertEqual(self.asked(), ["/api/nodejs.json", "/api/python.json"])
+
+    def test_a_product_that_failed_is_left_alone_for_an_hour_but_the_others_are_not(self):
+        self.server.table("nodejs", [], 503)
+        statuses = self.apps("Python 3.8.10 (64-bit)", "Node.js")
+        now = time.time()
+        badges.refresh_eol(self.cache, statuses, now)
+        self.assertEqual(self.asked(), ["/api/nodejs.json", "/api/python.json"])
+        self.cache.data["eol"].pop("python")                                 # something else needs python again
+        badges.refresh_eol(self.cache, statuses, now + 120)
+        self.assertEqual(self.asked(), ["/api/nodejs.json", "/api/python.json", "/api/python.json"])
+        badges.refresh_eol(self.cache, statuses, now + badges.FAILURE_BACKOFF + 1)
+        self.assertEqual(self.asked().count("/api/nodejs.json"), 2)
 
     def test_at_most_ten_requests_per_call(self):
         names = ["Python 3.8.10 (64-bit)", "Node.js", "PHP 8.3.4", "Microsoft .NET Runtime - 8.0.4 (x64)",

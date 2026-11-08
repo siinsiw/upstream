@@ -7,4 +7,4 @@ stability.install_crash_handlers()  # first, so a failing import below is report
 from upstream.app import main  # noqa: E402
 
 if __name__ == "__main__":
-    sys.exit(main())
+    stability.exit_now(main())

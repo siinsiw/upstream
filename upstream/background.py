@@ -9,7 +9,8 @@ Background calls these only on the UI thread.
 
 Settings read: tray_enabled, close_to_tray, check_interval_hours, notify_updates, auto_update.
 Settings written: last_check_ts (time of the last finished check), notified (what was announced) and auto_tried
-(what was installed automatically), the last two as short lists of "ident@version".
+(what was handed to the update queue automatically), the last two as short lists of "ident@version".
+The window also calls auto_finished(uid, ok, template) when an update it queued with auto=True ends.
 
 A tray icon is also shown when only the schedule and notifications are on: without one there is no place for a
 message to come from. The schedule compares the wall clock with last_check_ts once a minute, so a PC that slept
@@ -27,8 +28,9 @@ from typing import Callable
 from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
-from . import running
+from . import elevation, net, pins, running
 from .i18n import isolate, num, tr, trn
+from .scanner import NOTE_GITHUB_UNREACHABLE, NOTE_RATE_LIMITED
 from .ui.tray import TrayIcon
 
 log = logging.getLogger("upstream.background")
@@ -40,6 +42,7 @@ RESUME_GAP = 180.0              # the one-minute tick arriving later than this m
 RESUME_DELAY = 90.0             # ... and the check waits this long after waking up
 MAX_INTERVAL_HOURS = 24 * 366
 MAX_REMEMBERED = 400
+MAX_BLIND_SCANS = 3             # checks in a row that could not reach GitHub before they count as done anyway
 LISTED_NAMES = 3                # app names in a notification before "and N more"
 
 AUTOSTART_NAME = "Upstream"
@@ -63,6 +66,8 @@ class Background(QObject):
         self._started = self._last_tick = clock()
         self._quiet_until = 0.0
         self._last_attempt = -math.inf
+        self._auto_keys: dict[str, str] = {}    # uid -> "ident@version" of the automatic updates still running
+        self._blind_scans = 0
 
     # -- life cycle -----------------------------------------------------
     def start(self, minimized: bool = False) -> None:
@@ -174,6 +179,10 @@ class Background(QObject):
             return "the last attempt has not finished"
         if self.window.is_busy():
             return "Upstream is busy"
+        if QApplication.activeModalWidget() is not None:
+            # A dialog's own event loop keeps this timer firing. A scan that finished under it would replace the
+            # statuses the dialog is working on (a rollback picker, say).
+            return "a dialog is open"
         return None
 
     def _tick(self):
@@ -181,6 +190,10 @@ class Background(QObject):
         if now - self._last_tick > RESUME_GAP:
             self._quiet_until = now + RESUME_DELAY
         self._last_tick = now
+        # The clock was set back: times taken from the old, later clock must not hold the schedule up for hours.
+        self._started = min(self._started, now)
+        self._last_attempt = min(self._last_attempt, now)
+        self._quiet_until = min(self._quiet_until, now + RESUME_DELAY)
         try:
             if self.tray is not None:
                 self.tray.refresh()
@@ -197,18 +210,36 @@ class Background(QObject):
     # -- after a scan ---------------------------------------------------
     def scan_finished(self) -> None:
         """Called by the window after every scan: notify, then install the auto_update apps."""
-        self._save("last_check_ts", self.clock())
         try:
+            self._stamp_check()
             pending = [s for s in (self.window.statuses.get(uid) for uid in self.window.pending_updates())
                        if s and s.update]
             auto = self._auto_candidates(pending)
-            queued = {s.uid for s in auto}
-            self._announce([s for s in pending if s.uid not in queued])
-            self._install(auto)
+            refused = {s.uid for s in self._install(auto)}
+            handled = {s.uid for s in auto} - refused
+            self._announce([s for s in pending if s.uid not in handled])
         except Exception:
             log.exception("Handling the finished check failed")
         if self.tray is not None:
             self.tray.refresh()
+
+    def _stamp_check(self) -> None:
+        """Record that a check finished, unless it mostly could not reach GitHub (a PC that starts minimised at login
+        before Wi-Fi is up): the next try then comes after RETRY_AFTER, not after a whole interval. Three blind
+        checks in a row count anyway, so a repository that is gone for good cannot keep the schedule scanning."""
+        if self._github_unreachable() and self._blind_scans < MAX_BLIND_SCANS - 1:
+            self._blind_scans += 1
+            log.info("The check could not reach GitHub for most apps; trying again in %d minutes",
+                     RETRY_AFTER // 60)
+            return
+        self._blind_scans = 0
+        self._save("last_check_ts", self.clock())
+
+    def _github_unreachable(self) -> bool:
+        """At least half of the apps that have a GitHub repository ended the scan with a GitHub-failed note."""
+        with_repo = [s for s in self.window.statuses.values() if s.repo]
+        failed = [s for s in with_repo if s.note in (NOTE_GITHUB_UNREACHABLE, NOTE_RATE_LIMITED)]
+        return bool(with_repo) and 2 * len(failed) >= len(with_repo)
 
     def _announce(self, statuses):
         """One message for the updates nobody has been told about yet, unless the user is looking at the window."""
@@ -247,12 +278,14 @@ class Background(QObject):
     def _auto_skip(self, s, tried: list[str]) -> str | None:
         """Why this update must not install by itself, or None. The cheap checks come first:
         looking for running processes walks the process list."""
-        if s.pin:
-            return "pinned"
+        if s.pin or pins.pin_for(self.settings, s.app.ident):
+            return "pinned"     # the status can be older than the pin: a recheck is skipped while a scan runs
         if _key(s) in tried:
             return "already tried for this version (a failed or declined install is not repeated unattended)"
         if s.update.source == "site" and not s.update.download_url and not s.fallbacks:
             return "needs a manual download"
+        if elevation.needs_admin(s) and not elevation.is_elevated():
+            return "needs administrator rights, and nobody is there to accept the prompt"
         try:
             procs = running.find_running(s.app)
         except Exception as e:
@@ -261,16 +294,38 @@ class Background(QObject):
             return "running: " + ", ".join(sorted({p.name for p in procs}))
         return None
 
-    def _install(self, statuses):
-        if not statuses:
-            return
-        self._remember("auto_tried", [_key(s) for s in statuses])
+    def _install(self, statuses) -> list:
+        """Hand the updates to the queue. Only an update the queue accepted counts as tried; returns the ones it
+        did not take (an uninstall is running, ...), which the next check picks up again."""
+        queued, refused = [], []
         for s in statuses:
             log.info("Automatic update of %s to %s", s.app.name, s.update.version)
             try:
-                self.window.request_update(s.uid, bulk=True, auto=True)
+                taken = bool(self.window.request_update(s.uid, bulk=True, auto=True))
             except Exception:
                 log.exception("Automatic update of %s could not be queued", s.app.name)
+                taken = False
+            if taken:
+                queued.append(s)
+                self._auto_keys[s.uid] = _key(s)
+            else:
+                refused.append(s)
+                log.info("Automatic update of %s could not be queued now; the next check tries again", s.app.name)
+        if queued:
+            self._remember("auto_tried", [_key(s) for s in queued])
+        return refused
+
+    def auto_finished(self, uid: str, ok: bool, template: str = "") -> None:
+        """The window calls this when any update job ends. For an update Background queued it takes the version
+        back out of auto_tried if the job was turned away before it began by the connection policy (metered, or low
+        battery): that says nothing about the update, so the next check tries it again. Any other end, good or bad,
+        keeps the version tried. A uid Background did not queue is ignored."""
+        key = self._auto_keys.pop(uid, None)
+        if key is None or ok or not isinstance(template, str) or template not in net.PREFLIGHT_REFUSALS:
+            return
+        kept = [k for k in self._remembered("auto_tried") if k != key]
+        self._save("auto_tried", kept)
+        log.info("Automatic update %s was not started (%s); it will be tried again", key, template)
 
     # -- remembered keys ------------------------------------------------
     def _remembered(self, name: str) -> list[str]:

@@ -16,9 +16,13 @@ from unittest import mock
 
 from upstream import winget
 from upstream.context import CancelToken
-from upstream.errors import Cancelled
+from upstream.errors import Cancelled, StoppedWaiting
 
 STOPPED = "Stopped waiting for the installer. It may still be running."
+TIMED_OUT = ("The installer was still running after {minutes} minutes, so Upstream stopped waiting for it. "
+             "It may still be running.")
+PREPARING_TIMED_OUT = ("winget was still preparing the download after {minutes} minutes, so Upstream stopped it. "
+                       "Nothing was installed.")
 
 # What the fake prints. Each script ends by sleeping (or finishing) on its own, so a test that fails never
 # leaves a process behind for long.
@@ -177,6 +181,57 @@ class FakeWingetTest(unittest.TestCase):
 
         code, last = self.run_update(BANNER + "import sys; sys.exit(0)\n", token, on_line=cancel_once_gone)
         self.assertEqual((code, last), (0, "Found Demo [Demo.App] Version 2.0"))
+
+    # -- the time limit (install_timeout_min)
+    def test_an_install_that_outlasts_the_limit_is_left_running_and_reported_as_stopped_waiting(self):
+        hung = INSTALLING.replace(INSTALL_TIME, "time.sleep(30)\n")
+        started = time.monotonic()
+        with self.assertRaises(StoppedWaiting) as raised:
+            self.run_update(hung, timeout_min=0.02)
+        self.assertLess(time.monotonic() - started, 15)
+        self.assertEqual((raised.exception.template, raised.exception.values), (TIMED_OUT, {"minutes": "0.02"}))
+        (proc,) = self.procs
+        self.assertIsNone(proc.poll(), "an installing winget is never killed")
+
+    def test_a_winget_stuck_before_the_install_is_ended_with_what_it_started(self):
+        with self.assertRaises(Cancelled) as raised:
+            self.run_update(BANNER + GRANDCHILD + SLEEP, timeout_min=0.02,
+                            on_install=lambda: self.fail("it never got to install"))
+        self.assertNotIsInstance(raised.exception, StoppedWaiting)
+        self.assertEqual((raised.exception.template, raised.exception.values),
+                         (PREPARING_TIMED_OUT, {"minutes": "0.02"}))
+        (proc,) = self.procs
+        self.assertIsNotNone(proc.poll(), "winget must be gone")
+        self.assertTrue(self.kids, "the fake never reported its child")
+        self.assertTrue(until(lambda: not any(alive(pid) for pid in self.kids)), "its child must be gone too")
+
+    def test_a_download_that_keeps_moving_does_not_time_out(self):
+        bars = "".join(BAR.format(done=f"{i}.0", total="10.0") + "time.sleep(0.5)\n" for i in range(1, 7))
+        code, _ = self.run_update(BANNER + "import time\n" + bars + "import sys; sys.exit(0)\n", timeout_min=0.04)
+        self.assertEqual(code, 0)                       # three seconds in all, against a limit of 2.4 s
+        self.assertEqual(self.progress, [10, 20, 30, 40, 50, 60])
+
+    def test_the_install_gets_a_fresh_limit_when_it_starts(self):
+        # 1.8 s of preparing, then 1.5 s of installing: more than the 2.4 s limit in all, less in each part.
+        script = (BANNER + "import time\ntime.sleep(1.8)\n" + 'print("Starting package install...", flush=True)\n'
+                  + "time.sleep(1.5)\n")
+        code, _ = self.run_update(script, timeout_min=0.04)
+        self.assertEqual(code, 0)
+
+    def test_no_limit_means_it_waits(self):
+        for limit in (None, 0):
+            with self.subTest(limit=limit):
+                code, _ = self.run_update(BANNER + "import time; time.sleep(1.2)\n", timeout_min=limit)
+                self.assertEqual(code, 0)
+
+    def test_a_cancel_is_not_mistaken_for_the_limit(self):
+        token = CancelToken()
+        timer = threading.Timer(0.3, token.cancel)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        with self.assertRaises(Cancelled) as raised:
+            self.run_update(SLEEP, token, timeout_min=30)
+        self.assertEqual(raised.exception.template, "Cancelled.")
 
     # -- recognising the install
     def test_a_finished_download_is_the_start_of_the_install(self):

@@ -77,6 +77,27 @@ If one source fails, the next is tried automatically.
   dropped connection, HTTPS-only downloads unless a checksum is published, and a question before
   downloading on a metered connection or updating on low battery.
 
+## Everyday use
+
+- **Instant start.** The last result is shown at once ("Last checked …, refreshing…") while a fresh check runs.
+- **Update sizes.** Each offered update shows how much it will download, and Update all shows the total.
+  Sizes come from the GitHub asset or the installer's own HTTP headers; when a server does not say, nothing is shown.
+- **All apps.** Sort by name, size, install date, publisher or "updates first"; filter by updates, machine-wide or
+  current-user installs, possible duplicates, flagged and pinned apps; tick several apps to uninstall, export or ignore.
+- **Details.** The ⋯ menu opens a details window: size, install date, installer family, signer, the release notes,
+  and Repair or Modify for apps that support them.
+- **Pins and rollback.** Hold an app on its version, or on its major version, and roll back to an older version through winget.
+- **Badges.** Rows are marked when the update's notes mention security fixes, when a product's release line is past
+  end of life, or when the installed version is two or more major versions behind.
+- **Discover.** Search winget for a new app and install it through the same safe pipeline.
+- **History.** Installs, updates, rollbacks, uninstalls, cleanups and restores are recorded on your PC only.
+- **Background.** Optional tray icon, scheduled checks, notifications, and per-app automatic updates. An automatic
+  update never asks and never opens a setup window: it skips apps that need administrator rights while Upstream is
+  not elevated, installers with no silent mode, apps that are running, and tries each version once.
+- **Export.** Save the app list as JSON, CSV or a winget import file.
+- **One prompt for a batch.** When several updates need administrator rights, Upstream offers to restart once as administrator.
+- **Stability.** One window per user, an offline crash report you can read, and rotating logs.
+
 ## Uninstalling
 
 Every app's ⋯ menu has **Uninstall…**. Upstream runs the app's own uninstaller, quietly when it
@@ -89,8 +110,15 @@ Windows frameworks, and entries marked as not removable. Shared runtimes and dri
 
 Afterwards it can look for leftovers in files, folders, shortcuts, the registry, startup entries
 and services. Each item is rated Certain, Likely, Possible or Protected, with the reason it was
-found. Anything Windows or another installed app uses is Protected. The review is read-only for
-now: nothing is deleted. Cleanup with backups and undo is the next step.
+found. Anything Windows or another installed app uses is Protected and cannot be ticked.
+
+**Removing leftovers is reversible.** Only what you tick is touched, and every item is re-checked against
+the protection rules right before it is removed. Files, folders and shortcuts are moved into a backup folder,
+registry keys are exported first, and a Windows restore point is tried when allowed. **Undo** puts everything
+back (it never overwrites something that exists now), and **Backups…** in Settings lists, restores or deletes
+old backups; they are deleted automatically after the number of days you choose. A removed Windows service
+cannot be restored: reinstall the app. Several apps can be uninstalled in one go; the leftovers of all of
+them are reviewed together.
 
 ## Settings
 
@@ -114,6 +142,10 @@ with ETags, so repeat checks barely touch the quota.
 | `%APPDATA%\Upstream\settings.json` | language, theme, source overrides, ignored apps, skipped versions, install-safety policies, proxy (a proxy password is stored in plain text) |
 | `%LOCALAPPDATA%\Upstream\cache.json` | each app's repository and the latest releases |
 | `%LOCALAPPDATA%\Upstream\downloads\` | installers and partial downloads (`.part`); installers are deleted after the install, partials are kept to resume |
+| `%LOCALAPPDATA%\Upstream\last_scan.json` | the last scan, shown at once on the next start |
+| `%LOCALAPPDATA%\Upstream\history.jsonl` | the install / update / uninstall record (stays on your PC) |
+| `%LOCALAPPDATA%\Upstream\quarantine\` | backups made before leftovers are removed, for Undo |
+| `%LOCALAPPDATA%\Upstream\crashes\` | offline crash reports (never sent anywhere) |
 | `%LOCALAPPDATA%\Upstream\upstream.log` | full log |
 
 Settings from the earlier name (Tazeh) are copied over on first start.
@@ -135,6 +167,16 @@ upstream/
   exitcodes.py   what an installer's exit code means
   verify.py      what changed on the PC after the install
   updater.py     runs one update through those steps, with fallbacks
+  cleanup.py     leftover removal with backup, undo and purge
+  history.py     the install / update / uninstall record
+  background.py  tray icon, schedule, notifications, automatic updates
+  details.py     facts about one app, Repair and Modify
+  pins.py        version pins and rollback
+  badges.py      security and end-of-life badges
+  discover.py    winget search for new apps
+  export.py      app list export
+  elevation.py   one administrator restart for a batch
+  stability.py   single instance, crash reports, housekeeping
   uninstaller.py plans and runs an app's own uninstaller, then verifies it is gone
   leftovers.py   read-only leftover scan with confidence levels
   guard.py       paths and registry keys that are never offered for removal

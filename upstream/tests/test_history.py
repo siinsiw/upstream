@@ -470,6 +470,7 @@ class PageTests(Base):
         base = time.time() - 10_000
         self.write_lines(*(self.line(base + i, f"App {i:03}") for i in range(250)))
         page = self.page()
+        page.build_pending()
         page_size = page_module.PAGE
         self.assertEqual(page.list.count(), page_size)
         self.assertFalse(page.more_btn.isHidden())
@@ -478,11 +479,81 @@ class PageTests(Base):
         while not page.more_btn.isHidden():
             before = rows_of(page)
             page.more_btn.click()
+            page.build_pending()
             self.assertEqual(rows_of(page)[:len(before)], before)       # the rows already there are kept, not rebuilt
             self.assertEqual(page.list.count(), min(250, len(before) + page_size))
         self.assertEqual([r.entry.name for r in rows_of(page)], [f"App {i:03}" for i in range(249, -1, -1)])
         self.search_for(page, "App 00")      # a new search starts from the first page again
+        page.build_pending()
         self.assertEqual(page.list.count(), 10)
+
+    # -- rows are built a few at a time -----------------------------------
+    def fill_many(self, n: int):
+        base = time.time() - 10_000
+        self.write_lines(*(self.line(base + i, f"App {i:03}") for i in range(n)))
+
+    def settle(self, page: HistoryPage, count: int):
+        """Let the page's timer run until it lists `count` rows (and fail rather than hang when it never does)."""
+        for _ in range(600):
+            if page.list.count() == count and not page._queue:
+                return
+            QTest.qWait(5)
+        self.fail(f"{page.list.count()} rows listed, {count} expected")
+
+    def test_only_the_first_screenful_is_built_at_once_and_the_timer_does_the_rest(self):
+        self.fill_many(250)
+        page = self.page()
+        self.assertLess(page_module.FIRST_ROWS, page_module.PAGE)
+        self.assertEqual(page.list.count(), page_module.FIRST_ROWS, "what the UI thread pays for before it is free again")
+        self.assertEqual(len(page._queue), page_module.PAGE - page_module.FIRST_ROWS)
+        self.assertIn(str(250 - page_module.PAGE), page.more_btn.text(), "the button already counts the rows to come")
+        self.assertIs(page.stack.currentWidget(), page.list)
+        self.settle(page, page_module.PAGE)
+        self.assertEqual([r.entry.name for r in rows_of(page)], [f"App {i:03}" for i in range(249, 249 - 50, -1)])
+
+    def test_show_older_entries_is_built_the_same_way(self):
+        self.fill_many(250)
+        page = self.page()
+        page.build_pending()
+        page.more_btn.click()
+        self.assertEqual(page.list.count(), page_module.PAGE + page_module.FIRST_ROWS)
+        self.assertIn(str(250 - 2 * page_module.PAGE), page.more_btn.text())
+        self.settle(page, 2 * page_module.PAGE)
+        self.assertEqual(rows_of(page)[-1].entry.name, "App 150")
+
+    def test_a_newer_rebuild_ends_the_one_under_way(self):
+        self.fill_many(250)
+        page = self.page()
+        self.assertTrue(page._queue and page._builder.isActive())
+        self.search_for(page, "App 00")        # the user types before the first page is complete
+        self.settle(page, 10)
+        QTest.qWait(60)                        # nothing of the old page turns up afterwards
+        self.assertEqual(sorted(r.entry.name for r in rows_of(page)), [f"App {i:03}" for i in range(10)])
+        self.assertFalse(page._builder.isActive())
+        self.assertTrue(page.more_btn.isHidden())
+
+    def test_a_rebuild_with_nothing_to_list_leaves_no_timer_running(self):
+        self.fill_many(250)
+        page = self.page()
+        self.search_for(page, "no such app")
+        self.assertEqual((page.list.count(), page._queue, page._builder.isActive()), (0, [], False))
+        self.assertIs(page.stack.currentWidget(), page.empty)
+
+    def test_the_scroll_position_survives_a_language_switch_while_rows_are_still_coming(self):
+        self.fill_many(250)
+        page = self.page()
+        page.show()
+        page.build_pending()
+        page.more_btn.click()
+        page.build_pending()
+        bar = page.list.verticalScrollBar()
+        bar.setValue(bar.maximum() // 2)
+        wanted = bar.value()
+        self.assertGreater(wanted, 0)
+        page.retranslate()
+        self.assertLess(page.list.count(), 2 * page_module.PAGE, "not everything is back yet")
+        self.settle(page, 2 * page_module.PAGE)
+        self.assertEqual(bar.value(), wanted)
 
     def test_refresh_rebuilds_only_when_something_changed(self):
         history.record("update", "first")

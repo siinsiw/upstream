@@ -2,13 +2,13 @@
 i18n.FA is the union of every module's FA. Add a new module here when you add one."""
 from . import (
     background, badges, cleanup, details, detection, discover, elevation, exitcodes, export, history, inplace,
-    library, net, pipeline, pins, queue_cancel, running, settings_ui, settings_w2, shell, stability, trust, verify,
+    library, net, pipeline, pins, queue_cancel, running, settings_ui, settings_w2, shell, sizes, stability, trust, verify,
 )
 
 PARTS = (
     pipeline, detection, exitcodes, verify, inplace, trust, running, net, queue_cancel, settings_ui,
     cleanup, history, stability, background, details, export, elevation, pins, badges, discover, library, shell,
-    settings_w2,
+    settings_w2, sizes,
 )
 
 

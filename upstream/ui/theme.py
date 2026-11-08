@@ -63,6 +63,7 @@ THEMES: dict[str, dict] = {
         accent="#FFD400", accent_hover="#FFE45C", on_accent="#000000", accent_soft="#332B00",
         danger="#FF7070", gh_bg="#FFFFFF", gh_fg="#000000", wg_bg="#00314A", wg_fg="#9FE0FF",
         site_bg="#332B00", site_fg="#FFD400",
+        disabled="#9A9A9A", disabled_dashed=True,    # muted is nearly the text colour here: dim, and dash the border
     ),
 }
 THEME_ORDER = ["system", "paper", "graphite", "midnight", "arctic", "dune", "moss", "contrast"]
@@ -150,6 +151,10 @@ def stylesheet(t: dict, glyphs: dict) -> str:
     danger_hover = _shade(t["danger"], t["dark"])
     # muted text (protected rows) keeps 4.5:1 on bg in every theme but not on raised; High contrast has bg == surface
     row_hover = t["bg"] if t["bg"] != t["surface"] else t["raised"]
+    off = t.get("disabled", t["muted"])
+    # where muted is too close to the text colour, a disabled button is also drawn with a dashed border
+    dash = f"border-style: dashed; border-color: {off};" if t.get("disabled_dashed") else ""
+    dash_flat = f"border: 1px dashed {off}; padding: 6px 15px;" if t.get("disabled_dashed") else ""
     return f"""
     QWidget {{ color: {t['text']}; font-family: "Segoe UI"; font-size: 10pt; }}
     QMainWindow, #root, QDialog {{ background: {t['bg']}; }}
@@ -160,23 +165,26 @@ def stylesheet(t: dict, glyphs: dict) -> str:
     QPushButton {{ background: {t['surface']}; border: 1px solid {t['line']}; border-radius: 8px; padding: 7px 16px; }}
     QPushButton:hover {{ background: {t['raised']}; }}
     QPushButton:focus {{ border-color: {t['accent']}; }}
-    QPushButton:disabled {{ color: {t['muted']}; }}
+    QPushButton:disabled {{ color: {off}; {dash} }}
     QPushButton#primary {{ background: {t['accent']}; color: {t['on_accent']}; border: none; font-weight: 600; }}
     QPushButton#primary:hover {{ background: {t['accent_hover']}; }}
-    QPushButton#primary:disabled {{ background: {t['raised']}; color: {t['muted']}; }}
+    QPushButton#primary:disabled {{ background: {t['raised']}; color: {off}; {dash_flat} }}
     QPushButton#danger {{ background: {t['danger']}; color: {t['on_accent']}; border: none; font-weight: 600; }}
     QPushButton#danger:hover {{ background: {danger_hover}; }}
-    QPushButton#danger:disabled {{ background: {t['raised']}; color: {t['muted']}; }}
+    QPushButton#danger:disabled {{ background: {t['raised']}; color: {off}; {dash_flat} }}
     QPushButton#rowAction {{ padding: 6px 14px; min-width: 92px; }}
     QPushButton#rowAction[tone="accent"] {{ background: {t['accent_soft']}; color: {t['accent']}; border: 1px solid {t['accent_soft']}; font-weight: 600; }}
     QPushButton#rowAction[tone="accent"]:hover {{ background: {t['accent']}; color: {t['on_accent']}; border-color: {t['accent']}; }}
-    QPushButton#link {{ background: transparent; border: none; color: {t['muted']}; padding: 4px 6px; }}
+    QPushButton#rowAction:focus, QPushButton#rowAction[tone="accent"]:focus {{ border: 2px solid {t['accent']}; padding: 5px 13px; }}
+    QPushButton#rowAction[tone="accent"]:focus:hover {{ border-color: {t['on_accent']}; }}
+    QPushButton#link {{ background: transparent; border: 2px solid transparent; border-radius: 6px; color: {t['muted']}; padding: 2px 4px; }}
     QPushButton#link:hover {{ color: {t['text']}; }}
+    QPushButton#link:focus {{ border-color: {t['accent']}; color: {t['text']}; }}
 
-    QPushButton#seg {{ background: transparent; border: none; border-bottom: 2px solid transparent;
-                       border-radius: 0; padding: 6px 0; color: {t['muted']}; }}
+    QPushButton#seg {{ background: transparent; border: 2px solid transparent; border-radius: 0; padding: 5px 4px; color: {t['muted']}; }}
     QPushButton#seg:hover {{ color: {t['text']}; }}
     QPushButton#seg:checked {{ color: {t['text']}; border-bottom-color: {t['accent']}; font-weight: 600; }}
+    QPushButton#seg:focus {{ border-color: {t['accent']}; }}
 
     QLineEdit, QPlainTextEdit {{ background: {t['surface']}; border: 1px solid {t['line']}; border-radius: 8px; padding: 6px 10px;
                  selection-background-color: {t['accent']}; selection-color: {t['on_accent']};
@@ -196,9 +204,14 @@ def stylesheet(t: dict, glyphs: dict) -> str:
     QCheckBox::indicator {{ width: 16px; height: 16px; border: 1px solid {t['muted']}; border-radius: 4px; background: {t['surface']}; }}
     QCheckBox::indicator:hover {{ border-color: {t['accent']}; }}
     QCheckBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; image: url("{glyphs['check']}"); }}
+    QCheckBox::indicator:focus {{ border: 2px solid {t['accent']}; }}
+    QCheckBox::indicator:checked:focus {{ border-color: {t['text']}; }}
 
     QListWidget {{ background: transparent; border: none; outline: none; }}
     QListWidget::item, QListWidget::item:selected, QListWidget::item:hover {{ background: transparent; border: none; }}
+    QListWidget#versions::item {{ padding: 6px 10px; border-radius: 6px; }}
+    QListWidget#versions::item:hover {{ background: {t['raised']}; }}
+    QListWidget#versions::item:selected, QListWidget#versions::item:selected:hover {{ background: {t['accent']}; color: {t['on_accent']}; }}
 
     #row {{ background: {t['surface']}; border: 1px solid {t['line']}; border-radius: 10px; }}
     #row:hover {{ border-color: {t['muted']}; }}
@@ -222,8 +235,9 @@ def stylesheet(t: dict, glyphs: dict) -> str:
     QProgressBar {{ background: {t['raised']}; border: none; border-radius: 2px; }}
     QProgressBar::chunk {{ background: {t['accent']}; border-radius: 2px; }}
 
-    QToolButton#more {{ border: none; border-radius: 6px; padding: 2px 8px; font-size: 14pt; color: {t['muted']}; }}
+    QToolButton#more {{ border: 2px solid transparent; border-radius: 6px; padding: 0 6px; font-size: 14pt; color: {t['muted']}; }}
     QToolButton#more:hover {{ background: {t['raised']}; color: {t['text']}; }}
+    QToolButton#more:focus {{ border-color: {t['accent']}; color: {t['text']}; }}
     QToolButton#more::menu-indicator {{ image: none; width: 0; }}
     QMenu {{ background: {t['surface']}; border: 1px solid {t['line']}; padding: 4px; }}
     QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}

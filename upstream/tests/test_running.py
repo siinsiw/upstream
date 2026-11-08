@@ -178,6 +178,34 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(asker.questions, [])
         post.assert_called_once_with(self.procs)
 
+    def test_an_unattended_update_never_closes_a_running_app_whatever_the_policy_says(self):
+        for policy in ("ask", "auto", "never", "whatever"):
+            with self.subTest(policy=policy):
+                asker = Asker(True, True)
+                ctx = UpdateContext({"close_apps_policy": policy}, ask_fn=asker, auto=True)
+                post, terminate, progress = mock.Mock(return_value=2), mock.Mock(), mock.Mock()
+                with self.patched(_post_close=post, _terminate=terminate):
+                    with self.assertRaises(Cancelled) as raised:
+                        running.close_for_update(ctx, self.app, progress)
+                self.assertEqual((raised.exception.template, raised.exception.values),
+                                 ("Update cancelled: {name} is still running.", {"name": "Demo"}))
+                self.assertEqual(asker.questions, [])
+                post.assert_not_called()
+                terminate.assert_not_called()
+                progress.assert_not_called()
+
+    def test_an_unattended_update_goes_on_when_the_app_is_not_running(self):
+        for policy in ("ask", "auto", "never"):
+            with self.subTest(policy=policy):
+                ctx = UpdateContext({"close_apps_policy": policy}, auto=True)
+                with self.patched(find_running=lambda app: []):
+                    running.close_for_update(ctx, self.app, self.progress)
+
+    def test_an_attended_update_with_never_still_does_not_look(self):
+        ctx = UpdateContext({"close_apps_policy": "never"}, auto=False)
+        with self.patched(find_running=mock.Mock(side_effect=AssertionError("must not scan"))):
+            running.close_for_update(ctx, self.app, self.progress)
+
     def test_unknown_policy_behaves_like_ask(self):
         ctx, asker = make_ctx("whatever", False)
         with self.patched():

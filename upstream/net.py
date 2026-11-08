@@ -68,7 +68,10 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
             fp.close()
             log.warning("Refused a redirect from %s to %s", _origin(req.full_url), _origin(newurl))
             raise RedirectRefused(f"refused a redirect from {old} to {new or 'an unknown scheme'}")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        follow = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if follow is not None and req.get_method() == "HEAD":
+            follow.method = "HEAD"      # urllib forgets the method on a redirect, and a size lookup must not start a download
+        return follow
 
 
 def _is_loopback(host: str | None) -> bool:
@@ -82,13 +85,16 @@ def _is_loopback(host: str | None) -> bool:
         return False
 
 
+def is_secure(url: str) -> bool:
+    """https, or a loopback address that never leaves the PC."""
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme.lower() == "https" or _is_loopback(parts.hostname)
+
+
 def _require_secure(url: str, expected_sha256: str | None) -> None:
     """Anything not on https can be swapped by whoever sits on the path, so it is only acceptable
     when a published SHA-256 vouches for the file. Loopback never leaves the PC and is exempt."""
-    if expected_sha256:
-        return
-    parts = urllib.parse.urlsplit(url)
-    if parts.scheme.lower() == "https" or _is_loopback(parts.hostname):
+    if expected_sha256 or is_secure(url):
         return
     log.warning("Refused to download from %s: not https and no published checksum", _origin(url))
     raise InstallError("Refused: this download isn't served over HTTPS and has no published checksum.")
@@ -290,13 +296,23 @@ def _policy(ctx, key: str) -> str:
     return value if value in ("ask", "skip", "ignore") else "ask"
 
 
+# What preflight refuses with. A refusal that only reflects the moment (not the update) is worth trying again
+# later: background.auto_finished uses this set to decide whether an unattended update was really "tried".
+REFUSED_METERED = N_("Not updated: this PC is on a metered connection.")
+REFUSED_BATTERY = N_("Not updated: the battery is at {percent}% and the PC is not plugged in.")
+REFUSED_BATTERY_SAVER = N_("Not updated: battery saver is on and the PC is not plugged in.")
+PREFLIGHT_REFUSALS = frozenset({REFUSED_METERED, REFUSED_BATTERY, REFUSED_BATTERY_SAVER})
+
+
 def _gate(ctx, kind: str, policy: str, question: str, detail: str, yes: str, refusal: str, values: dict) -> None:
-    """Skip refuses outright; ask asks (once per "Update all" batch). A refusal raises Cancelled."""
+    """Skip refuses outright; ask asks (once per "Update all" batch). A refusal raises Cancelled.
+    An unattended job (ctx.auto) is never asked, so its automatic "No" says nothing about what the user would
+    answer and is not remembered: it would silently refuse the user's own next "Update all"."""
     if policy == "ask":
         answer = _remembered(kind) if ctx.bulk else None
         if answer is None:
             answer = ctx.ask(question, detail=detail, yes=yes, no=N_("Not now"), **values)
-            if ctx.bulk:
+            if ctx.bulk and not ctx.auto:
                 _remember(kind, answer)
         if answer:
             return
@@ -313,7 +329,7 @@ def preflight(ctx) -> None:
               N_("This PC is on a metered connection. Download updates anyway?"),
               N_("Updates can be large and may count against your data plan."),
               N_("Download anyway"),
-              N_("Not updated: this PC is on a metered connection."), {})
+              REFUSED_METERED, {})
     policy = _policy(ctx, "battery_policy")
     status = battery_status() if policy != "ignore" else None
     if status and status[0]:
@@ -324,13 +340,13 @@ def preflight(ctx) -> None:
             _gate(ctx, "battery", policy,
                   N_("The battery is at {percent}% and the PC is not plugged in. Update anyway?"), detail,
                   N_("Update on battery"),
-                  N_("Not updated: the battery is at {percent}% and the PC is not plugged in."),
+                  REFUSED_BATTERY,
                   {"percent": percent})
         elif battery_saver():
             _gate(ctx, "battery", policy,
                   N_("Battery saver is on and the PC is not plugged in. Update anyway?"), detail,
                   N_("Update on battery"),
-                  N_("Not updated: battery saver is on and the PC is not plugged in."), {})
+                  REFUSED_BATTERY_SAVER, {})
 
 
 # --- download --------------------------------------------------------------------------------

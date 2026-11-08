@@ -2,7 +2,7 @@
 FA: dict[str, str] = {
     "JSON list": "فهرست JSON",
     "Spreadsheet (CSV)": "صفحه‌گسترده (CSV)",
-    "winget import file": "فایل ورود برای winget",
+    "winget import file": "فایل import برای winget",
     "Saved a list of {n} app.": "فهرست {n} برنامه ذخیره شد.",
     "Saved a list of {n} apps.": "فهرست {n} برنامه ذخیره شد.",
     "No app has a winget ID, so no file was saved.": "هیچ برنامه‌ای شناسهٔ winget ندارد، برای همین فایلی ذخیره نشد.",

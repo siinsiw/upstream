@@ -16,7 +16,7 @@ SOURCE_LABELS = {"github": "GitHub", "winget": "Official site · winget", "site"
 # Stored message arguments that are themselves translatable (a source label, a known error message).
 _TRANSLATED_ARGS = {"source", "error"}
 # Stored arguments that are plain quantities: Persian shows them with Persian digits.
-_NUMBER_ARGS = {"percent", "minutes"}
+_NUMBER_ARGS = {"percent", "minutes", "n"}
 
 FA = {
     # window
@@ -237,8 +237,7 @@ FA = {
     "That location no longer exists.": "این محل دیگر وجود ندارد.",
     "Copied the registry key. Paste it into the address bar of Registry Editor.":
         "کلید رجیستری کپی شد. آن را در نوار آدرس Registry Editor بچسبان.",
-    "Export list…": "ذخیرهٔ فهرست…",
-    "Export list": "ذخیرهٔ فهرست",
+    "Export list": "خروجی فهرست",
     "Text files (*.txt)": "فایل‌های متنی (*.txt)",
     "Leftovers of {name}": "باقی‌مانده‌های {name}",
     "Made by Upstream on {date}": "ساخته‌شده با Upstream در {date}",

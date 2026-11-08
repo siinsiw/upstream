@@ -25,7 +25,9 @@ from .widgets import ElidedLabel, ui_is_rtl
 log = logging.getLogger("upstream.ui.history")
 
 LOAD_LIMIT = 1000     # entries read from disk
-PAGE = 50             # rows built at a time: a row is a dozen widgets and styling them takes a few ms each
+PAGE = 50             # rows listed at a time
+FIRST_ROWS = 8        # a row is a dozen widgets and styling them takes a few ms: the first screenful is built at once,
+CHUNK_ROWS = 4        # the rest of a page a few rows per timer tick, so typing in the search box never stalls the UI
 SEARCH_DELAY_MS = 120
 VERSION_WIDTH = 170   # columns of a row that have a fixed width
 WHEN_WIDTH = 100
@@ -312,6 +314,8 @@ class HistoryPage(QWidget):
         self._matches: list[tuple[HistoryEntry, str]] = []      # what the filter and search let through: entry, message
         self._shown = PAGE
         self._row_height: int | None = None
+        self._queue: list[tuple[HistoryEntry, str]] = []         # rows still to build, in order
+        self._restore_scroll: int | None = None                  # where a rebuild should end up once the rows are there
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -374,6 +378,9 @@ class HistoryPage(QWidget):
         self._debounce.setSingleShot(True)
         self._debounce.setInterval(SEARCH_DELAY_MS)
         self._debounce.timeout.connect(self._filter_changed)
+        self._builder = QTimer(self)
+        self._builder.setSingleShot(True)
+        self._builder.timeout.connect(self._build_step)
         self._tick = QTimer(self)   # while the tab stays open: pick up new entries, and 'x minutes ago' ages
         self._tick.setInterval(60_000)
         self._tick.timeout.connect(self.refresh)
@@ -422,18 +429,30 @@ class HistoryPage(QWidget):
         kind = self.kind_filter.currentData()
         needle = self.search.text().strip().casefold()
         self._matches = [(e, m) for e, hay, m in self._index if (not kind or e.kind == kind) and needle in hay]
-        scroll = self.list.verticalScrollBar().value() if keep_scroll else 0
+        self._restore_scroll = self.list.verticalScrollBar().value() if keep_scroll else None
+        self._builder.stop()        # a newer rebuild ends the one still under way
+        self._queue = []
         self.list.setUpdatesEnabled(False)
         self.list.clear()
         self._row_height = None
         self._add_rows(self._matches[:self._shown])
         self.list.setUpdatesEnabled(True)
-        self.list.verticalScrollBar().setValue(scroll)
+        if keep_scroll:
+            self._scroll_back()
+        else:
+            self.list.verticalScrollBar().setValue(0)
         self._sync()
 
     def _add_rows(self, matches: list[tuple[HistoryEntry, str]]):
+        """List `matches`: the first few rows now, the rest by the timer (see _build_step)."""
+        self._queue.extend(matches)
+        self._build_rows(FIRST_ROWS)
+        if self._queue:
+            self._builder.start(0)
+
+    def _build_rows(self, count: int):
         now = time.time()
-        for entry, message in matches:
+        for entry, message in self._queue[:count]:
             row = HistoryRow(entry, message, now)
             if self._row_height is None:    # every row is as tall as the first; asking each one is slow
                 self._row_height = row.sizeHint().height()
@@ -441,12 +460,35 @@ class HistoryPage(QWidget):
             item.setSizeHint(QSize(0, self._row_height))
             self.list.addItem(item)
             self.list.setItemWidget(item, row)
+        del self._queue[:count]
+
+    def _build_step(self):
+        self._build_rows(CHUNK_ROWS)
+        self._scroll_back()
+        if self._queue:
+            self._builder.start(0)
+
+    def _scroll_back(self):
+        """Return to where a rebuild started from; the list only reaches that far once enough rows are built."""
+        if self._restore_scroll is None:
+            return
+        bar = self.list.verticalScrollBar()
+        bar.setValue(self._restore_scroll)
+        if bar.value() == self._restore_scroll or not self._queue:
+            self._restore_scroll = None
+
+    def build_pending(self) -> None:
+        """Build the rows that are still waiting for the timer (the page does this by itself a few at a time)."""
+        self._builder.stop()
+        while self._queue:
+            self._build_step()
+            self._builder.stop()
 
     def _sync(self):
         """Everything that depends on what is listed: the empty state, the notice, the buttons."""
         self.clear_btn.setEnabled(bool(self._entries))
         self.notice.setVisible(not self._recording and bool(self._entries))
-        left = len(self._matches) - self.list.count()
+        left = len(self._matches) - self.list.count() - len(self._queue)
         self.more_btn.setVisible(left > 0)
         self.more_btn.setText(trn("Show {n} older entry", "Show {n} older entries", left) if left > 0 else "")
         if self.list.count():
@@ -469,7 +511,8 @@ class HistoryPage(QWidget):
         self._rebuild()
 
     def _show_more(self):
-        built = self.list.count()
+        built = self.list.count() + len(self._queue)
+        self._restore_scroll = None
         self._shown += PAGE
         self._add_rows(self._matches[built:self._shown])
         self._sync()
