@@ -1,4 +1,4 @@
-"""What an installer's exit code means. Owner: the exit-code feature.
+"""What an installer's exit code means.
 
 Sources: Windows Installer error codes (learn.microsoft.com/windows/win32/msi/error-codes), Windows system error
 codes (learn.microsoft.com/windows/win32/debug/system-error-codes), Inno Setup exit codes (jrsoftware.org/ishelp,

@@ -29,6 +29,17 @@ Build a standalone `Upstream.exe` (no Python needed on the target PC):
 powershell -ExecutionPolicy Bypass -File build.ps1 -Dest C:\Users\<you>\Apps
 ```
 
+## Development
+
+```bat
+set QT_QPA_PLATFORM=offscreen
+python -X utf8 run_tests.py                  rem the whole suite, one process (12 to 16 minutes)
+python -X utf8 run_tests.py test_cleanup.py  rem one module
+python -X utf8 tools\check_i18n.py           rem every English string has a Persian entry
+```
+
+`CLAUDE.md` has the architecture, the safety rules, the conventions and the release checklist.
+
 ## Where updates come from
 
 For each app, in this order:

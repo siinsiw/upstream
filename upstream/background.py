@@ -1,6 +1,6 @@
-"""Tray icon, scheduled checks, notifications, per-app automatic updates. Owner: the background feature.
+"""Tray icon, scheduled checks, notifications, per-app automatic updates.
 
-The main window offers this API to Background (the integrator implements it on MainWindow):
+The main window offers this API to Background (MainWindow implements it):
     window.statuses: dict[str, AppStatus]       window.settings
     window.start_scan()                          window.is_busy() -> bool   (scanning, updating or uninstalling)
     window.show_and_raise()                      window.pending_updates() -> list[str]   (uids with an update)

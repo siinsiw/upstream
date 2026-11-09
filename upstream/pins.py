@@ -1,4 +1,4 @@
-"""Hold an app on a version (or a major line) and roll back to an older one. Owner: the pins feature.
+"""Hold an app on a version (or a major line) and roll back to an older one.
 
 A pin lives in settings["pins"]: {ident: {"mode": "hold" | "major", "version": "1.2.3"}}. Hold offers no update
 at all. Major offers only updates inside the major line the app is on (3.12.4 -> 3.13.0, never 4.0.0)."""

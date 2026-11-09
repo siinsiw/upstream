@@ -1,4 +1,4 @@
-"""Remove leftovers after an uninstall, with a backup and an undo. Owner: the leftover-cleanup feature.
+"""Remove leftovers after an uninstall, with a backup and an undo.
 
 Only the items run() is given are touched, and only after leftovers.py proposed them. Each one is checked
 again right before it goes (guard.py, the other installed apps, links, a size that changed since the scan),
@@ -138,7 +138,7 @@ class RestoreResult:
 
 
 def configure(settings) -> None:
-    """The integrator calls this at start; run() reads cleanup_restore_point from it."""
+    """Called once at start-up; run() reads cleanup_restore_point from it."""
     global _settings
     _settings = settings
 

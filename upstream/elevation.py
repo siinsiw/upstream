@@ -1,4 +1,4 @@
-"""One UAC prompt for a whole batch: run Upstream itself as administrator. Owner: the elevation feature.
+"""One UAC prompt for a whole batch: run Upstream itself as administrator.
 
 Machine-wide installers each raise their own UAC prompt. The supported way to see one prompt per batch is to run the
 whole program elevated for that session (relaunch_elevated). A privileged helper service was rejected on purpose: a

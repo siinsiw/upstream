@@ -1,4 +1,4 @@
-"""Facts about one installed app, and its Repair / Modify actions. Owner: the app-details feature.
+"""Facts about one installed app, and its Repair / Modify actions.
 
 gather() reads what is cheap (registry values already in InstalledApp, a few file-system checks); the slow
 parts are separate calls for a worker thread: folder_size() (a folder walk) and signer_of() (PowerShell).

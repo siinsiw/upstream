@@ -1,4 +1,4 @@
-"""Single instance, crash reports, log and download housekeeping. Owner: the stability feature.
+"""Single instance, crash reports, log and download housekeeping.
 
 Import-light on purpose (standard library only, Qt is imported inside the functions that need it):
 main.py installs the crash handlers before the heavy imports, so a failing import is reported too."""

@@ -1,4 +1,4 @@
-"""The main window with every Wave 2 feature wired in, offscreen and against fakes: tabs, the library factory, the row
+"""The main window with every feature wired in, offscreen and against fakes: tabs, the library factory, the row
 menu, pins and rollback, history, background hooks, export, the administrator banner, instant start, Discover,
 the Updates sort and download size, and the settings sections. Nothing here starts a scan, an install, a tray icon,
 an elevation or an autostart write, and nothing touches the real settings or data folder (temp folders and fakes)."""

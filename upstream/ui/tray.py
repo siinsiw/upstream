@@ -1,4 +1,4 @@
-"""Tray icon with its menu. Owner: the background feature.
+"""Tray icon with its menu.
 
 The icon is the app icon; while updates are waiting it carries a small dot in the theme's danger colour. The
 tooltip and the menu are rebuilt by refresh(), which Background calls every minute and the menu calls when it

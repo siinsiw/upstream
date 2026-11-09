@@ -1,4 +1,4 @@
-"""Export the installed-app list, to set up another PC. Owner: the export feature.
+"""Export the installed-app list, to set up another PC.
 
 Three formats: json (everything Upstream knows about each app), csv (the same table for a spreadsheet; UTF-8 with a
 BOM so Excel shows Persian text correctly) and winget (the package file `winget import -i <file>` accepts, schema

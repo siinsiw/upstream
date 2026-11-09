@@ -8,8 +8,7 @@ Certificate names (1 and 2) must match exactly once case, punctuation, word orde
 the registry text only has to be contained in the signer's name. A signer the user accepted after a warning
 (settings["signers_approved"]) counts as the usual one for that app, without replacing the remembered CN.
 A file without a signature is fine only for an app with no signed baseline (most open-source apps); with no
-baseline, a signature Windows rejects (untrusted, broken, unsupported) is still questioned.
-Owner: the publisher-signature feature."""
+baseline, a signature Windows rejects (untrusted, broken, unsupported) is still questioned."""
 from __future__ import annotations
 
 import logging

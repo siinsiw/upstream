@@ -1,4 +1,4 @@
-"""Check, after an installer returns, what really happened on the PC. Owner: the install-verification feature.
+"""Check, after an installer returns, what really happened on the PC.
 
 snapshot() records the app family's Uninstall entries (same app name, any scope) and the pending-restart flags
 before the installer runs; check() reads them again and decides:

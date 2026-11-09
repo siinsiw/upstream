@@ -85,7 +85,7 @@ class Settings(JsonStore):
             "include_prereleases": False,
             "language": "en",
             "theme": "system",
-            # --- install safety (wave 1) ---
+            # --- install safety ---
             "publisher_policy": "ask",        # ask | block | off: an update signed by a different publisher
             "signers": {},                    # ident -> certificate CN last seen on a verified install
             "signers_approved": {},           # ident -> [CN]: signers the user accepted after a warning
@@ -94,7 +94,7 @@ class Settings(JsonStore):
             "metered_policy": "ask",          # ask | skip | ignore: downloading on a metered connection
             "battery_policy": "ask",          # ask | skip | ignore: updating while on battery
             "install_timeout_min": 30,        # stop waiting for one installer after this many minutes
-            # --- wave 2 ---
+            # --- features: history, background, pins, cleanup, badges ---
             "history_enabled": True,          # record installs, updates and uninstalls (history.py)
             "tray_enabled": False,            # tray icon next to the clock (background.py)
             "close_to_tray": False,           # closing the window keeps Upstream running in the tray
